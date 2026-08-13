@@ -1,7 +1,6 @@
 # Retirement Withdrawal Strategies Planner
 
-An educational Excel planner that compares two ways to spend down a retirement
-portfolio:
+An Excel retirement planner that compares two ways to spend down a portfolio:
 
 1. **The classic 4% rule** — withdraw 4% of the starting portfolio in year one, then
    raise that dollar amount by inflation every year (William Bengen, 1994).
@@ -10,99 +9,164 @@ portfolio:
    band) and smoothed by a **shock absorber** (a cap on year-to-year spending changes).
 
 It is inspired by the Wall Street Journal article *"The 4% Rule for Retirement Is Too
-Simple. Here's a Better Way."* This is an educational illustration, **not financial
-advice**.
+Simple. Here's a Better Way."*, but it is built to be **used**, not just to illustrate
+the idea: every figure is after tax, after fees, and after the costs that usually decide
+whether a plan actually works — pre-Medicare healthcare, long-term care, and RMDs.
+It is still an educational tool, **not financial advice**.
 
-The workbook is generated entirely from code. `build_retirement_planner.py` is the
-single source of truth — edit it and re-run the workflow below to regenerate the
-spreadsheet. Do not hand-edit the `.xlsx`; your changes will be overwritten on the
-next build.
+The workbook is generated entirely from code. Do not hand-edit the `.xlsx`; your changes
+will be overwritten on the next build.
+
+> **The generated `.xlsx` is not committed.** At ~50 MB it exceeds GitHub's warning
+> threshold, and because every rebuild rewrites the whole binary it would add that much to
+> history each time it changed. It is in `.gitignore`; regenerate it with the workflow
+> below, or publish it as a GitHub Release asset when you want to share it.
+> `Retirement Withdrawal Strategies Planner (v1 - original).xlsx` *is* committed — it is the
+> small hand-built original, kept for reference.
 
 ## Repository contents
 
 | File | Purpose |
 | --- | --- |
-| `build_retirement_planner.py` | Builds the workbook (all tabs, formulas, charts, conditional formatting, data validation, sheet protection) with **openpyxl**. Outputs `Retirement Withdrawal Strategies Planner.xlsx` next to the script. |
-| `recalc_excel.ps1` | Opens the workbook in Microsoft Excel via COM, forces a full recalculation, scans every cell for formula errors (`#REF!`, `#DIV/0!`, etc.), and re-saves. Reports `STATUS: success - zero formula errors` or lists the offending cells. |
-| `patch_metadata.py` | Strips personal author metadata that Excel stamps on save, resetting the document author fields to a generic value. Leaves all worksheet content, charts, and conditional formatting intact. |
-| `AGENTS.md` | This guide. |
+| `model_spec.py` | **Shared source of truth for data and defaults**: historical returns/CPI 1928–2025, SSA claiming factors, IRS Uniform Lifetime (RMD) divisors, scenario definitions, and every default input value. Imported by the builder *and* the validator so the two cannot drift apart. |
+| `build_retirement_planner.py` | Builds the workbook (tabs, formulas, charts, conditional formatting, data validation, comments, sheet protection) with **openpyxl**. |
+| `recalc_excel.ps1` | Opens the workbook via Excel COM, forces a full recalculation, scans for error values using `SpecialCells` (fast — not a per-cell walk), and re-saves. Reports `STATUS: success - zero formula errors`. |
+| `validate_model.py` | **The real correctness gate.** Recomputes the entire model independently in Python and compares ~18,500 cells against the values Excel calculated — every row of both strategy tabs, the life-expectancy engine, all 1,000 Monte Carlo outcomes, and the results panel. |
+| `test_scenarios.py` | Drives the workbook through 33 alternate input sets **and 5 Monte Carlo configurations** via COM (edge-case ages, couples, stagflation, account mixes, both ceiling bases, parametric vs historical bootstrap…) and re-checks every one against the shadow model. This is what catches bugs that only appear when inputs move. |
+| `test_inputs_live.py` | Perturbs all 45 inputs — each in a context where it *should* matter — and asserts something downstream changes. Catches an input that is added to the sheet and to `DEFAULTS` but never wired into a formula: the workbook would still build, still recalculate without error, and silently ignore the user. Pure Python, no Excel needed. |
+| `patch_metadata.py` | Strips personal author metadata that Excel stamps on save. |
+| `.gitignore` | Excludes the generated workbook, Excel `~$` lock files and `__pycache__`. |
 
 ## Prerequisites
 
-- **Python 3.9+** with `openpyxl`:
+- **Python 3.9+** with `openpyxl` (and `pywin32` for `test_scenarios.py`):
   ```bash
-  pip install openpyxl
+  pip install openpyxl pywin32
   ```
-- **Windows with Microsoft Excel** — required only for `recalc_excel.ps1`, which uses
-  Excel COM automation to compute formula values and validate the file. (openpyxl
-  writes formulas but does not evaluate them.)
-- **PowerShell** (bundled with Windows) to run the `.ps1` script.
-
-> No Excel? You can still build the workbook with `build_retirement_planner.py`; the
-> formulas will simply be uncalculated until first opened in a spreadsheet app. If you
-> have LibreOffice, you can substitute a headless `soffice --calc` recalculation for
-> step 2.
+- **Windows with Microsoft Excel** — required for `recalc_excel.ps1` and
+  `test_scenarios.py`. openpyxl writes formulas but does not evaluate them.
 
 ## How to (re)generate the spreadsheet
 
-Run these three steps from the repository folder, in order:
-
 ```powershell
-# 1. Build the workbook (formulas written, not yet calculated)
-python build_retirement_planner.py
-
-# 2. Recalculate + validate (requires Excel on Windows)
-powershell -ExecutionPolicy Bypass -File recalc_excel.ps1
-
-# 3. Scrub personal metadata Excel stamped on save
-python patch_metadata.py
+python build_retirement_planner.py                          # 1. write formulas   (~20s)
+powershell -ExecutionPolicy Bypass -File recalc_excel.ps1    # 2. calculate + scan (~90s)
+python validate_model.py                                    # 3. verify the numbers
+python test_inputs_live.py                                  # 4. verify every input is live
+python test_scenarios.py                                    # 5. verify other inputs (~25min)
+python patch_metadata.py                                    # 6. scrub metadata
 ```
 
 Expected output:
 
 ```
 saved: ...\Retirement Withdrawal Strategies Planner.xlsx
+recalculated in 78.4s
 STATUS: success - zero formula errors
+cells compared: 18,529
+STATUS: success - model matches Excel on every compared cell
+STATUS: success - every input changes the model
+STATUS: success - all 33 input scenarios and 5 Monte Carlo scenarios match the shadow model
 metadata patched. creator: Retirement Planner | lastModifiedBy: Retirement Planner
 ```
 
-The result is `Retirement Withdrawal Strategies Planner.xlsx` in the same folder.
+> **Steps 3-5 are not optional in spirit.** Step 2 only proves no cell contains an
+> error value. It cannot catch a formula that computes the wrong number — which is
+> exactly how the previous version shipped an operator-precedence bug that inflated
+> every Monte Carlo ending balance. Step 5 is slow because every scenario forces a
+> full recalculation of the 71,000-row engine; run it before any commit, not on
+> every edit.
 
 ## Workbook structure
 
-The generated workbook has these tabs (in order):
+- **Instructions** — how to use it, what the metrics mean, and what the model still omits.
+- **Inputs & Summary** — all editable inputs (yellow, grouped by topic with hover notes),
+  a verdict box, the results panel, **plan diagnostics**, the scenario detail table, and
+  two charts.
+- **Monte Carlo** — parametric and historical-bootstrap pressure tests over 1,000 shared paths.
+- **Dynamic Strategy** / **4% Rule** — year-by-year detail, hover notes on every column.
+- **Life Expectancy** — interpolated remaining-years table plus the survival curve and
+  last-survivor (joint) life expectancy.
+- **Historical Returns** — S&P 500, 10-year Treasury and CPI, 1928–2025.
+- **Reference Tables** — SSA claiming factors and IRS RMD divisors.
+- **Article** — the narrative the model is based on.
+- Hidden: **Chart Data** (trims chart series to the horizon), **MC Engine**, **MC Outcomes**.
 
-- **Instructions** — how to use the planner, color key, and how to unlock the sheets.
-- **Inputs & Summary** — all editable inputs (yellow cells), a plain-English verdict
-  box, the results panel, a market-scenario selector, life-expectancy anchors, a
-  Social Security claiming-factor table, and two comparison charts.
-- **Dynamic Strategy** — year-by-year dynamic withdrawals (life expectancy → guardrails
-  → shock absorber), with hover notes on every column header.
-- **4% Rule** — year-by-year classic 4% withdrawals.
-- **Life Expectancy** — remaining-years table, fully interpolated from four anchor
-  inputs (current age, 62, 67, 70) sourced from the SSA life-expectancy calculator.
-- **Article** — the narrative the model is based on, with the source link.
+## Key model conventions
 
-### Key model conventions
+- **Horizon.** Years modelled = `plan_age - start_age`, covering ages `start_age` through
+  `plan_age - 1`. The "balance at plan-to age" is the **ending** balance of the last of
+  those years. Getting this off by one shifts every headline number.
+- **Everything is after tax.** Essential spending is entered as an after-tax figure.
+  Three account balances are tracked — taxable, traditional and Roth — and a gross
+  withdrawal is sourced **taxable first, then traditional, then Roth**, the conventional
+  order that lets sheltered money compound longest. Only the *gain* portion of a taxable
+  sale is taxed (at the capital-gains rate), traditional dollars are taxed at the
+  **age-banded** ordinary rate (early / Social-Security / RMD phase), Roth is untaxed, and
+  the taxable account's dividends are taxed annually whether or not they are spent.
+- **RMDs are a tax drag, not forced spending.** If the RMD exceeds what the strategy
+  wanted to spend, the excess is withdrawn from the traditional account, taxed, and the
+  after-tax remainder is **reinvested into the taxable account** (raising its cost basis).
+  Only the tax leaves the plan.
+- **Inflation is per-year, not a constant.** Both strategy tabs carry an inflation column
+  and a cumulative price index. Stagflation raises inflation as well as lowering returns;
+  the historical bootstrap samples the return *and* that same year's CPI together.
+- **Order of operations in the dynamic rule:** life-expectancy withdrawal → guardrail band
+  → shock absorber → RMD tax. The shock absorber runs last and can therefore hold spending
+  *outside* the guardrail band; that is intended, and a diagnostic reports when it happens.
+- **The guardrail band is an age switch, not a market response.** The actuarial withdrawal
+  is `balance / remaining years`, so its implied *rate* is always `1 / remaining years` —
+  the balance cancels. The ceiling therefore binds at a fixed age (whenever remaining years
+  drop below `1 / ceiling`) regardless of market performance. The *shock absorber* is the
+  part that reacts to markets. A flat 6% ceiling switches the strategy off from about age
+  71, so the default basis is **age-graduated**: `multiple × IRS Uniform Lifetime rate`,
+  clamped to the table's 72–120 range, which at the default 2.0× first binds around age 83.
+  Set the basis to *Fixed %* for the original article behaviour. Ages outside the Life
+  Expectancy tab's 35–110 range fall back to the flat ceiling via `IFERROR`; the shadow
+  model mirrors this.
+- **The headline metric is "covers essentials every year", not "money lasts".** A rule that
+  withdraws a percentage of the remaining balance can almost never reach zero, so portfolio
+  survival flatters it by construction. Both are shown; essentials leads.
+- **Monte Carlo** shares every path between strategies and uses the fixed `MC_SEED` for
+  reproducibility. Change `MC_SEED` in `model_spec.py` for an independent batch.
 
-- **Nominal vs. today's dollars** — most columns are nominal (future) dollars; columns
-  and results labeled *(today's $)* are restated in today's buying power so figures are
-  comparable across years.
-- **Social Security** — enter the full benefit (at full retirement age 67) and a start
-  age (62–70). The model applies the SSA claiming factor (70% at 62 … 124% at 70, for
-  those born 1960 or later) and pays it only from the start age onward.
-- **Mid-retirement use** — the dynamic strategy is meant to be re-run each year: set the
-  start age to your current age and the portfolio to your current balance.
-- **Color coding** — yellow = inputs, black = calculated, green = pulled from another
-  tab, grey = today's-dollars restatement, red highlight = a balance/spending shortfall.
-- Every build is validated to contain **zero formula errors**.
+## Known simplifications (all bias the plan to look *better* than reality)
+
+**Spending needs never drain the portfolio.** This is the most significant one. Each year's
+need — essentials, pre-65 healthcare, long-term care — is *compared* against after-tax
+income, but the strategy withdraws according to its own rule regardless. A 6-year
+$250k/yr care event therefore shows up as extra shortfall years while leaving the ending
+balance completely unchanged. In reality you would sell assets to pay a hard bill like
+nursing care, compounding the damage. Flexible discretionary spending is arguably fine to
+model this way; unavoidable costs are not.
+
+Tax is a single effective rate per phase rather than real brackets, so there is no
+Social-Security tax torpedo and no bracket-filling logic; Roth conversions and
+withdrawal-order optimisation cannot be expressed; no IRMAA surcharges, no
+state-specific rules, no survivor-benefit changes, no haircut for a Social Security
+trust-fund shortfall; historical returns are US-only and resampled IID, so no mean
+reversion and no sustained bear markets. Treat a marginal result as a failing one.
 
 ## For AI agents
 
-- Treat `build_retirement_planner.py` as the single source of truth. Make all changes
-  there, then run the three-step workflow above and confirm
-  `STATUS: success - zero formula errors`.
-- Result-row numbers on the **Inputs & Summary** tab are referenced by the verdict box
-  and by conditional formatting. If you insert or remove result rows, update those
-  references together.
-- Keep the workbook free of personal information; always run `patch_metadata.py` last.
+- `model_spec.py` and `build_retirement_planner.py` are the source of truth. Never edit the
+  `.xlsx`.
+- **Put shared data and defaults in `model_spec.py`.** If the builder and the validator
+  disagree about a constant, the validator's guarantee is worthless.
+- Input cells are assigned rows dynamically by the `InputBlock` registry, and result rows
+  are recorded in the `RES` dict. Do not hard-code row numbers — reference `RES[key]`.
+  `test_scenarios.py` finds inputs by their **label text**, so if you rename a label,
+  update `LABEL_TO_KEY` (Inputs & Summary) or `MC_LABEL_TO_KEY` (Monte Carlo) there.
+- When adding a formula, add its shadow implementation to `validate_model.py` in the same
+  change. A formula with no shadow is unverified.
+- **When adding an input, add it to a scenario in `test_scenarios.py` and to `CASES` in
+  `test_inputs_live.py`.** Monte Carlo inputs live on a different sheet and were missed by
+  the address map for exactly this reason, leaving the historical-bootstrap engine path
+  unvalidated. An input that no test perturbs is an input nobody has proven is connected.
+- Beware operator precedence when interpolating formula fragments: `f"={a}/{b}"` where `b`
+  is `"x*(1+y)"` silently becomes `(a/x)*(1+y)`. Parenthesise interpolated denominators.
+- `MIN(IF(...))`-style array formulas require Ctrl+Shift+Enter in older Excel; prefer
+  `INDEX`/`MATCH`.
+- The **Chart Data** sheet deliberately returns `#N/A` past the horizon so chart lines
+  stop. That is not an error.
+- Always finish with `patch_metadata.py` and keep the workbook free of personal data.

@@ -1,0 +1,21 @@
+# The planner workbook is generated entirely from build_retirement_planner.py.
+# It is ~50 MB and every rebuild rewrites the whole binary, so committing it would
+# add that much to history each time. Regenerate it with the workflow in AGENTS.md,
+# or download it from a GitHub Release.
+Retirement Withdrawal Strategies Planner.xlsx
+
+# Excel lock files, created while the workbook is open
+~$*.xlsx
+*.tmp
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
