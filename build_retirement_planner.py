@@ -1479,10 +1479,10 @@ _rrow = [PANEL_TOP + 1]
 
 
 def res(label, formula, fmt=CUR, color=GREEN, section=False, bold=False, key=None,
-        space=False, wrap=False):
+        space=False, wrap=False, note=None):
     """Write one result row. `space` inserts a blank separator row above it;
-    `wrap` lets a long text answer wrap inside the value cell instead of
-    overflowing into the next column."""
+    `wrap` lets a long text answer wrap inside the value cell; `note` attaches a
+    hover explanation to the label."""
     if space:
         _rrow[0] += 1
     r_ = _rrow[0]
@@ -1498,6 +1498,10 @@ def res(label, formula, fmt=CUR, color=GREEN, section=False, bold=False, key=Non
             c.number_format = fmt
         c.alignment = Alignment(horizontal="right", vertical="center", wrap_text=wrap)
         c.border = bottom_only
+    if note:
+        cm = Comment(note, "Planner")
+        cm.width, cm.height = 320, 140
+        lc.comment = cm
     if key:
         RES[key] = r_
     _rrow[0] += 1
@@ -1519,7 +1523,7 @@ def rng_to_horizon(sheet, col):
 res("Years modelled (start age to plan-to age)", f"={q(plan_age)}-{q(start_age)}", NUM, BLACK,
     key="years")
 res("Net expected return after fees",
-    f"=(1+{q(exp_ret)})*(1-{q(fee)})-1", PCT2, BLACK, key="netret")
+    f"=(1+{q(exp_ret)})*(1-{q(fee)})-1", PCT2, BLACK, key="netret", space=True)
 
 res("— DOES THE PLAN WORK? —", None, section=True)
 res("Dynamic: essentials covered every year?",
@@ -1552,11 +1556,34 @@ res("Guardrail ceiling starts capping spending at",
     f'=IF(MIN({BIND_RANGE})>=9999,"never — the rule runs freely",'
     f'"age "&MIN({BIND_RANGE})&" (of "&{HORIZON}&" years modelled)")',
     "General", BLACK, key="ceil_bind_age", wrap=True)
-res("Taxable account runs dry at",
-    f'=IF(COUNTIF({D_}$AE${R0}:{idx(D_, "AE")},0)=0,"not within the plan",'
-    f'"age "&({q(start_age)}+MATCH(0,{D_}$AE${R0}:{idx(D_, "AE")},0)-1)&'
-    f'" — from then on every withdrawal is fully taxable")',
-    "General", BLACK, key="tx_dry", wrap=True)
+
+
+def exhausted_at(col):
+    """The age at which one account's ending balance first reaches zero."""
+    rng = f"{D_}${col}${R0}:{idx(D_, col)}"
+    return (f'=IF(COUNTIF({rng},0)=0,"not within the plan",'
+            f'"age "&({q(start_age)}+MATCH(0,{rng},0)-1))')
+
+
+# The withdrawal order is brokerage -> traditional -> Roth, so these three ages map
+# the whole tax arc of the plan: cheap, then expensive, then free.
+res("Brokerage accounts exhausted at", exhausted_at("AE"), "General", BLACK,
+    key="tx_dry",
+    note="Spent first. Only the GAIN is taxed, at capital-gains rates, so these are your "
+         "cheapest withdrawals. When this account empties you move to the traditional IRA "
+         "and your tax bill RISES. It is also the point at which you lose the flexibility "
+         "to control which year your taxable income lands in — which is what makes Roth "
+         "conversions and ACA-subsidy management possible.")
+res("Traditional IRA accounts exhausted at", exhausted_at("AF"), "General", BLACK,
+    key="td_dry",
+    note="Spent second. Every dollar is ordinary income — the deferred tax bill coming due — "
+         "and this is the balance RMDs are calculated from. When it empties you move to the "
+         "Roth and your withdrawals become tax-free.")
+res("Roth accounts exhausted at", exhausted_at("AG"), "General", BLACK,
+    key="roth_dry",
+    note="Spent last, so it compounds untouched for as long as possible. Withdrawals are "
+         "tax-free and it is not subject to RMDs. If this shows an age inside your plan, the "
+         "portfolio has run out entirely.")
 
 res("— 4% RULE —", None, section=True, space=True)
 res("First-year after-tax income (today's $)", f"={F_}$X${R0}", CUR, GREEN, key="four_first")
@@ -1695,6 +1722,9 @@ for i, formula in enumerate(diagnostics):
     c = ws.cell(r_, 5, formula)
     c.font = font(size=9)
     c.alignment = Alignment(wrap_text=True, vertical="top")
+    # every row that carries a diagnostic gets the taller height, set as it is
+    # written so the two can never drift apart
+    ws.row_dimensions[r_].height = 45
     ws.merge_cells(start_row=r_, start_column=5, end_row=r_, end_column=6)
     ws.conditional_formatting.add(f"E{r_}", FormulaRule(
         formula=[f'LEFT(E{r_},7)="WARNING"'],
@@ -1709,11 +1739,6 @@ for i, formula in enumerate(diagnostics):
         fill=PatternFill("solid", start_color=GREEN_FILL),
         font=Font(name=ARIAL, size=9, color=GREEN_FONT)))
 DIAG_LAST = DIAG_ROW + len(diagnostics)
-
-# The diagnostics carry long wrapped sentences, so they get a fixed taller row.
-# Everything above them keeps Excel's default height.
-for r_ in range(DIAG_ROW + 1, DIAG_LAST + 1):
-    ws.row_dimensions[r_].height = 45
 
 # ---- charts ----
 CHART_ROW = max(IB.row, DIAG_LAST) + 2

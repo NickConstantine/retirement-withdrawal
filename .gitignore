@@ -2,7 +2,10 @@
 # It is ~50 MB and every rebuild rewrites the whole binary, so committing it would
 # add that much to history each time. Regenerate it with the workflow in AGENTS.md,
 # or download it from a GitHub Release.
-Retirement Withdrawal Strategies Planner.xlsx
+# The pattern also covers manually saved copies (…v2.xlsx, …copy.xlsx, and so on);
+# the small hand-built v1 original is kept as an explicit exception.
+Retirement Withdrawal Strategies Planner*.xlsx
+!Retirement Withdrawal Strategies Planner (v1 - original).xlsx
 
 # Excel lock files, created while the workbook is open
 ~$*.xlsx

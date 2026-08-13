@@ -150,7 +150,11 @@ def main():
     if not os.path.exists(BOOK):
         print("MISSING WORKBOOK - run build_retirement_planner.py first")
         return 1
-    xl = w32.Dispatch("Excel.Application")
+    # DispatchEx forces a dedicated Excel process. Plain Dispatch() attaches to an
+    # already-running instance, which means the suite would drive whatever workbook
+    # the user happens to have open — and closing that window kills the run mid-way
+    # with "The object invoked has disconnected from its clients".
+    xl = w32.DispatchEx("Excel.Application")
     xl.Visible = False
     xl.DisplayAlerts = False
     xl.UserName = "Retirement Planner"
@@ -307,8 +311,15 @@ def main():
         xl.CalculateFullRebuild()
         wb.Save()
     finally:
-        wb.Close(True)
-        xl.Quit()
+        # cleanup must not raise, or it masks whatever actually went wrong
+        try:
+            wb.Close(True)
+        except Exception:
+            pass
+        try:
+            xl.Quit()
+        except Exception:
+            pass
 
     print()
     if total_fail:

@@ -201,6 +201,16 @@ def need_today(year, age):
     return n
 
 
+def exhausted_label(rows, col):
+    """Mirror of the workbook's account-exhausted result rows.
+
+    Excel uses MATCH(0, range, 0) — an exact match — which is safe because each
+    ending balance is wrapped in MAX(..., 0) and therefore lands on a true zero.
+    """
+    age = next((r["B"] for r in rows if r[col] == 0), None)
+    return "not within the plan" if age is None else f"age {age}"
+
+
 def scen_return(year):
     s = D["scenario"]
     if s == "Steady":
@@ -542,6 +552,12 @@ def main():
           else f"age {a} (of {horizon} years modelled)")(
              next((r["B"] for r in dyn_h
                    if 1 / r["C"] > ceiling_for(r["B"]) + 1e-6), None))),
+        ("DYNAMIC STRATEGY", "Brokerage accounts exhausted at",
+         exhausted_label(dyn_h, "AE")),
+        ("DYNAMIC STRATEGY", "Traditional IRA accounts exhausted at",
+         exhausted_label(dyn_h, "AF")),
+        ("DYNAMIC STRATEGY", "Roth accounts exhausted at",
+         exhausted_label(dyn_h, "AG")),
         ("4% RULE", "First-year after-tax income (today's $)", shared[0]["X"]),
         ("4% RULE", "Lowest annual after-tax income (today's $)",
          min(r["X"] for r in four_h)),
