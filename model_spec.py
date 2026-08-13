@@ -138,6 +138,7 @@ DEFAULTS = {
     "ceiling_mult": 2.0,
     "shock": 0.05,
     "shock_basis": "Real",
+    "shortfall_mode": "Follow the rule",
     "current_4pct": 0,
     # ---- taxes: effective ordinary rates by retirement phase ----
     "tax_early": 0.10,
@@ -167,3 +168,10 @@ DEFAULTS = {
 
 SS_TAXABLE_SHARE = 0.85          # simplification: 85% of the benefit is taxable
 INFLATION_FLOOR = -0.05          # parametric inflation draws are floored here
+
+# A year counts as a shortfall only if income misses the need by more than this, in
+# today's dollars. In "Withdraw enough to cover needs" mode the withdrawal is solved so
+# that income equals the need EXACTLY, which leaves a long tail of results sitting on
+# zero to within floating-point dust. Without a tolerance, Excel and Python round those
+# to opposite sides and disagree about whether the year was funded.
+SHORTFALL_TOL = 1.0

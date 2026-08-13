@@ -32,8 +32,8 @@ will be overwritten on the next build.
 | `build_retirement_planner.py` | Builds the workbook (tabs, formulas, charts, conditional formatting, data validation, comments, sheet protection) with **openpyxl**. |
 | `recalc_excel.ps1` | Opens the workbook via Excel COM, forces a full recalculation, scans for error values using `SpecialCells` (fast — not a per-cell walk), and re-saves. Reports `STATUS: success - zero formula errors`. |
 | `validate_model.py` | **The real correctness gate.** Recomputes the entire model independently in Python and compares ~18,500 cells against the values Excel calculated — every row of both strategy tabs, the life-expectancy engine, all 1,000 Monte Carlo outcomes, and the results panel. |
-| `test_scenarios.py` | Drives the workbook through 33 alternate input sets **and 5 Monte Carlo configurations** via COM (edge-case ages, couples, stagflation, account mixes, both ceiling bases, parametric vs historical bootstrap…) and re-checks every one against the shadow model. This is what catches bugs that only appear when inputs move. |
-| `test_inputs_live.py` | Perturbs all 45 inputs — each in a context where it *should* matter — and asserts something downstream changes. Catches an input that is added to the sheet and to `DEFAULTS` but never wired into a formula: the workbook would still build, still recalculate without error, and silently ignore the user. Pure Python, no Excel needed. |
+| `test_scenarios.py` | Drives the workbook through 40 alternate input sets **and 6 Monte Carlo configurations** via COM (edge-case ages, couples, stagflation, account mixes, both ceiling bases, both shortfall modes, parametric vs historical bootstrap…) and re-checks every one against the shadow model. This is what catches bugs that only appear when inputs move. |
+| `test_inputs_live.py` | Perturbs all 46 inputs — each in a context where it *should* matter — and asserts something downstream changes. Catches an input that is added to the sheet and to `DEFAULTS` but never wired into a formula: the workbook would still build, still recalculate without error, and silently ignore the user. Pure Python, no Excel needed. |
 | `patch_metadata.py` | Strips personal author metadata that Excel stamps on save. |
 | `.gitignore` | Excludes the generated workbook, Excel `~$` lock files and `__pycache__`. |
 
@@ -53,7 +53,7 @@ python build_retirement_planner.py                          # 1. write formulas 
 powershell -ExecutionPolicy Bypass -File recalc_excel.ps1    # 2. calculate + scan (~90s)
 python validate_model.py                                    # 3. verify the numbers
 python test_inputs_live.py                                  # 4. verify every input is live
-python test_scenarios.py                                    # 5. verify other inputs (~25min)
+python test_scenarios.py                                    # 5. verify other inputs (~5min)
 python patch_metadata.py                                    # 6. scrub metadata
 ```
 
@@ -61,21 +61,31 @@ Expected output:
 
 ```
 saved: ...\Retirement Withdrawal Strategies Planner.xlsx
-recalculated in 78.4s
+recalculated in 95.3s
 STATUS: success - zero formula errors
-cells compared: 18,529
+cells compared: 18,532
 STATUS: success - model matches Excel on every compared cell
 STATUS: success - every input changes the model
-STATUS: success - all 33 input scenarios and 5 Monte Carlo scenarios match the shadow model
+STATUS: success - all 40 input scenarios and 6 Monte Carlo scenarios match the shadow model
 metadata patched. creator: Retirement Planner | lastModifiedBy: Retirement Planner
 ```
 
 > **Steps 3-5 are not optional in spirit.** Step 2 only proves no cell contains an
 > error value. It cannot catch a formula that computes the wrong number — which is
 > exactly how the previous version shipped an operator-precedence bug that inflated
-> every Monte Carlo ending balance. Step 5 is slow because every scenario forces a
-> full recalculation of the 71,000-row engine; run it before any commit, not on
-> every edit.
+> every Monte Carlo ending balance. Run step 5 before any commit, not on every edit.
+
+> **`test_scenarios.py` drives Excel in manual-calculation mode** and recalculates only
+> the sheets a change can reach. That is what took it from ~100 minutes to ~5, but the
+> **sheet order is load-bearing**: `Worksheet.Calculate()` reads whatever the *other*
+> sheets currently hold, so a sheet calculated too early sees stale precedents. The order
+> in `recalc_deterministic()` is Monte Carlo → Historical Returns → Life Expectancy →
+> 4% Rule → Dynamic Strategy → MC Engine → MC Outcomes. Getting it wrong fails loudly
+> (mismatches, never false passes) — but it does fail, so do not reorder casually.
+
+> **The suite uses `DispatchEx`, not `Dispatch`.** Plain `Dispatch` attaches to an
+> already-running Excel instance, so the suite would drive *your* open workbook and die
+> the moment you closed a window. `DispatchEx` forces its own isolated process.
 
 ## Workbook structure
 
@@ -126,19 +136,34 @@ metadata patched. creator: Retirement Planner | lastModifiedBy: Retirement Plann
   model mirrors this.
 - **The headline metric is "covers essentials every year", not "money lasts".** A rule that
   withdraws a percentage of the remaining balance can almost never reach zero, so portfolio
-  survival flatters it by construction. Both are shown; essentials leads.
+  survival flatters it by construction — in *Follow the rule* mode it is close to
+  meaningless. Only in *Withdraw enough to cover needs* mode can the dynamic strategy
+  genuinely deplete, because the spending floor overrides the guardrails in bad years.
+  Both are shown; essentials leads.
+- **The spending floor is solved, not searched.** `required_gross()` walks the sourcing
+  layers (taxable → traditional → Roth) and grosses each slice up by its own tax factor.
+  It is written that way in both the builder and the shadow model deliberately: the closed-
+  form algebra is easy to get sign-wrong, and a sign error there silently changes results
+  rather than raising an error.
+- **Coverage tests use `SHORTFALL_TOL`, not a raw `< 0`.** In *cover needs* mode income
+  equals the need *exactly*, so floating-point noise leaves surpluses around 1e-11 — and
+  Excel and Python round those to opposite sides of zero. Every "did this year fall short"
+  test compares against `-SHORTFALL_TOL` (one dollar) in both the workbook and the shadow
+  model. Changing it in `model_spec.py` changes both.
 - **Monte Carlo** shares every path between strategies and uses the fixed `MC_SEED` for
   reproducibility. Change `MC_SEED` in `model_spec.py` for an independent batch.
 
 ## Known simplifications (all bias the plan to look *better* than reality)
 
-**Spending needs never drain the portfolio.** This is the most significant one. Each year's
-need — essentials, pre-65 healthcare, long-term care — is *compared* against after-tax
-income, but the strategy withdraws according to its own rule regardless. A 6-year
-$250k/yr care event therefore shows up as extra shortfall years while leaving the ending
-balance completely unchanged. In reality you would sell assets to pay a hard bill like
-nursing care, compounding the damage. Flexible discretionary spending is arguably fine to
-model this way; unavoidable costs are not.
+**Spending needs drain the portfolio only in one mode.** The input *"If the Dynamic
+Strategy rule falls short of spending needs"* controls this. In **Follow the rule**
+(the default) each year's need — essentials, pre-65 healthcare, long-term care — is
+*compared* against after-tax income but never forces a withdrawal, so a care event shows
+up as extra shortfall years while leaving the ending balance unchanged. In **Withdraw
+enough to cover needs** the model solves for the gross withdrawal that nets the need after
+tax and takes it, so hard bills actually deplete the portfolio. Neither is wholly right:
+discretionary spending really is flexible, unavoidable costs really are not. Run both and
+read the spread.
 
 Tax is a single effective rate per phase rather than real brackets, so there is no
 Social-Security tax torpedo and no bracket-filling logic; Roth conversions and

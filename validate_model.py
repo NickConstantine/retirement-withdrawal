@@ -150,6 +150,27 @@ def rmd_from(age, td):
     return 0.0
 
 
+def required_gross(tx, td, basis, ord_rate_, need_nominal, ss_gross_):
+    """Smallest gross withdrawal that nets `need_nominal` after tax.
+
+    Mirrors the workbook: walk the sourcing layers (taxable -> traditional -> Roth),
+    taking what is needed from each and grossing that slice up by its own tax factor.
+    """
+    gcg = gain_fraction(tx, basis) * D["cg_rate"]
+    short = max(need_nominal - ss_gross_ * (1 - spec.SS_TAXABLE_SHARE * ord_rate_), 0.0)
+    a = tx * (1 - gcg)
+    b = td * (1 - ord_rate_)
+    return (min(short, a) / (1 - gcg)
+            + min(max(short - a, 0.0), b) / (1 - ord_rate_)
+            + max(short - a - b, 0.0))
+
+
+def apply_shortfall_floor(rule_w, required, total):
+    if D["shortfall_mode"] == "Withdraw enough to cover needs":
+        return min(max(rule_w, required), total)
+    return min(rule_w, total)
+
+
 def step_accounts(age, tx, td, rt, basis, w, r):
     """Advance one year. Returns (after-tax spendable, next tx/td/rt/basis, tax pieces)."""
     o = ord_rate(age)
@@ -314,7 +335,10 @@ def dynamic(shared):
             stp = (1 + pr["E"]) if D["shock_basis"] == "Real" else 1.0
             prev = pr["P"] * stp
             o = min(prev * (1 + D["shock"]), max(prev * (1 - D["shock"]), n))
-        p_ = min(o, l)
+        t_need = need_today(yr, age)
+        y = D["full_ss"] * ss_factor() * f if age >= D["ss_age"] else 0.0
+        req = required_gross(h, i, kk, g_, t_need * f, y)
+        p_ = apply_shortfall_floor(o, req, l)
         qq = p_ / l if l else 0.0
         st = step_accounts(age, h, i, j, kk, p_, d)
         r, s, t = st["f_tx"], st["f_td"], st["f_rt"]
@@ -322,11 +346,10 @@ def dynamic(shared):
         v = st["rmd_extra"]
         w = st["tax_wd"]
         x = st["div_tax"]
-        y = D["full_ss"] * ss_factor() * f if age >= D["ss_age"] else 0.0
         z = y * spec.SS_TAXABLE_SHARE * g_
         aa = p_ - st["tax_spend"] + y - z
         ab = aa / f
-        ac = need_today(yr, age)
+        ac = t_need
         ad = ab - ac
         tot = st["ntx"] + st["ntd"] + st["nrt"]
         rows.append(dict(A=yr, B=age, C=c, D=d, E=e, F=f, G=g_, H=h, I=i, J=j, K=kk, L=l,
@@ -386,18 +409,6 @@ def monte_carlo():
             d_total = d_tx + d_td + d_rt
             guarded = min(ceiling_for(age) * d_total,
                           max(D["floor"] * d_total, d_total / max(pyrs, 0.5)))
-            if d_prev is None:
-                wd = min(guarded, d_total)
-                changes.append(None)
-            else:
-                stp = (1 + last_infl) if D["shock_basis"] == "Real" else 1.0
-                prev = d_prev * stp
-                wd = min(min(prev * (1 + D["shock"]),
-                             max(prev * (1 - D["shock"]), guarded)), d_total)
-                changes.append(wd / d_prev - 1 if d_prev > 0 else 0.0)
-            std = step_accounts(age, d_tx, d_td, d_rt, d_bs, wd, ret)
-            d_sp.append((wd - std["tax_spend"]
-                         + ss * (1 - spec.SS_TAXABLE_SHARE * o)) / index)
             nd = D["essential"] * (1 + D["drift"]) ** (y - 1)
             if age < 65:
                 nd += D["healthcare"]
@@ -405,6 +416,20 @@ def monte_carlo():
                     and D["ltc_age"] <= age < D["ltc_age"] + D["ltc_years"]):
                 nd += D["ltc_cost"]
             needs.append(nd)
+            req = required_gross(d_tx, d_td, d_bs, o, nd * index, ss)
+            if d_prev is None:
+                wd = apply_shortfall_floor(guarded, req, d_total)
+                changes.append(None)
+            else:
+                stp = (1 + last_infl) if D["shock_basis"] == "Real" else 1.0
+                prev = d_prev * stp
+                rule = min(prev * (1 + D["shock"]),
+                           max(prev * (1 - D["shock"]), guarded))
+                wd = apply_shortfall_floor(rule, req, d_total)
+                changes.append(wd / d_prev - 1 if d_prev > 0 else 0.0)
+            std = step_accounts(age, d_tx, d_td, d_rt, d_bs, wd, ret)
+            d_sp.append((wd - std["tax_spend"]
+                         + ss * (1 - spec.SS_TAXABLE_SHARE * o)) / index)
             f_tx, f_td, f_rt, f_bs = st4["ntx"], st4["ntd"], st4["nrt"], st4["nbasis"]
             d_tx, d_td, d_rt, d_bs = std["ntx"], std["ntd"], std["nrt"], std["nbasis"]
             d_prev = wd
@@ -418,15 +443,15 @@ def monte_carlo():
         real_changes = [c for c in changes[1:] if c is not None]
         out.append(dict(
             four_lasts=1 if f_end > 0 else 0,
-            four_ess=1 if all(a >= b for a, b in zip(f_sp, needs)) else 0,
+            four_ess=1 if all(a >= b - spec.SHORTFALL_TOL for a, b in zip(f_sp, needs)) else 0,
             four_bal=f_end / deflator,
             four_low=min(f_sp), four_sum=sum(f_sp),
             dyn_lasts=1 if d_end > 0 else 0,
-            dyn_ess=1 if all(a >= b for a, b in zip(d_sp, needs)) else 0,
+            dyn_ess=1 if all(a >= b - spec.SHORTFALL_TOL for a, b in zip(d_sp, needs)) else 0,
             dyn_bal=d_end / deflator,
             dyn_low=min(d_sp), dyn_sum=sum(d_sp),
-            four_share=sum(1 for a, b in zip(f_sp, needs) if a >= b) / pos,
-            dyn_share=sum(1 for a, b in zip(d_sp, needs) if a >= b) / pos,
+            four_share=sum(1 for a, b in zip(f_sp, needs) if a >= b - spec.SHORTFALL_TOL) / pos,
+            dyn_share=sum(1 for a, b in zip(d_sp, needs) if a >= b - spec.SHORTFALL_TOL) / pos,
             dyn_worst=min(real_changes) if real_changes else 0.0))
     return out
 
@@ -528,9 +553,9 @@ def main():
         (None, "Net expected return after fees",
          (1 + D["exp_ret"]) * (1 - D["fee"]) - 1),
         ("DOES THE PLAN WORK?", "Dynamic: essentials covered every year?",
-         "YES" if all(r["AD"] >= 0 for r in dyn_h) else "NO"),
+         "YES" if all(r["AD"] >= -spec.SHORTFALL_TOL for r in dyn_h) else "NO"),
         ("DOES THE PLAN WORK?", "4% rule: essentials covered every year?",
-         "YES" if all(r["Z"] >= 0 for r in four_h) else "NO"),
+         "YES" if all(r["Z"] >= -spec.SHORTFALL_TOL for r in four_h) else "NO"),
         ("DYNAMIC STRATEGY", "First-year after-tax income (today's $)", dyn[0]["AB"]),
         ("DYNAMIC STRATEGY", "Lowest annual after-tax income (today's $)",
          min(r["AB"] for r in dyn_h)),
@@ -539,9 +564,9 @@ def main():
         ("DYNAMIC STRATEGY", "Lifetime after-tax income (today's $)",
          sum(r["AB"] for r in dyn_h)),
         ("DYNAMIC STRATEGY", "Years spending falls short of needs",
-         sum(1 for r in dyn_h if r["AD"] < 0)),
+         sum(1 for r in dyn_h if r["AD"] < -spec.SHORTFALL_TOL)),
         ("DYNAMIC STRATEGY", "Share of years essentials are covered",
-         1 - sum(1 for r in dyn_h if r["AD"] < 0) / horizon),
+         1 - sum(1 for r in dyn_h if r["AD"] < -spec.SHORTFALL_TOL) / horizon),
         ("DYNAMIC STRATEGY", "Real income at plan-to age vs. year 1",
          dyn[horizon - 1]["AB"] / dyn[0]["AB"] - 1),
         ("DYNAMIC STRATEGY", "Balance at plan-to age (today's $)", dyn[horizon - 1]["AJ"]),
@@ -564,9 +589,9 @@ def main():
         ("4% RULE", "Lifetime after-tax income (today's $)",
          sum(r["X"] for r in four_h)),
         ("4% RULE", "Years spending falls short of needs",
-         sum(1 for r in four_h if r["Z"] < 0)),
+         sum(1 for r in four_h if r["Z"] < -spec.SHORTFALL_TOL)),
         ("4% RULE", "Share of years essentials are covered",
-         1 - sum(1 for r in four_h if r["Z"] < 0) / horizon),
+         1 - sum(1 for r in four_h if r["Z"] < -spec.SHORTFALL_TOL) / horizon),
         ("4% RULE", "Balance at plan-to age (today's $)", shared[horizon - 1]["AF"]),
         ("4% RULE", "Money lasts to plan-to age?",
          "YES" if shared[horizon - 1]["AE"] > 0 else "NO"),

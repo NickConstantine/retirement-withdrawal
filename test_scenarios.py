@@ -53,6 +53,7 @@ LABEL_TO_KEY = {
     "Age-graduated ceiling — multiple of the IRS rate": "ceiling_mult",
     "Shock absorber — max spending change per year": "shock",
     "Shock absorber applies to": "shock_basis",
+    "If the Dynamic Strategy rule falls short of spending needs": "shortfall_mode",
     "Current 4% rule withdrawal if already retired (today's $/yr; 0 if not)": "current_4pct",
     "Effective tax rate — before Social Security starts": "tax_early",
     "Effective tax rate — Social Security until RMDs": "tax_ss",
@@ -113,6 +114,19 @@ SCENARIOS = [
     ("ceiling-grad-old-start", {"ceiling_basis": "Age-graduated", "start_age": 80,
                                 "plan_age": 100, "cur_age_le": 80, "le_cur": 10.4}),
     ("ceiling-grad-couple", {"ceiling_basis": "Age-graduated", "household": "Couple"}),
+    ("cover-needs", {"shortfall_mode": "Withdraw enough to cover needs"}),
+    ("cover-needs-crash", {"shortfall_mode": "Withdraw enough to cover needs",
+                           "scenario": "Early crash"}),
+    ("cover-needs-stagflation", {"shortfall_mode": "Withdraw enough to cover needs",
+                                 "scenario": "Stagflation"}),
+    ("cover-needs-all-traditional", {"shortfall_mode": "Withdraw enough to cover needs",
+                                     "taxable0": 0, "traditional0": 3_500_000, "roth0": 0}),
+    ("cover-needs-all-roth", {"shortfall_mode": "Withdraw enough to cover needs",
+                              "taxable0": 0, "traditional0": 0, "roth0": 3_500_000}),
+    ("cover-needs-cheap", {"shortfall_mode": "Withdraw enough to cover needs",
+                           "essential": 50_000, "healthcare": 0}),
+    ("cover-needs-ruinous", {"shortfall_mode": "Withdraw enough to cover needs",
+                             "essential": 400_000}),
 ]
 
 # Monte Carlo inputs live on the Monte Carlo sheet, not Inputs & Summary, which is
@@ -135,6 +149,7 @@ MC_SCENARIOS = [
     ("mc-historical-95pct-stock", {"mc_method": "Historical bootstrap", "mc_stock": 0.95}),
     ("mc-high-volatility", {"mc_vol": 0.25, "mc_infl_vol": 0.06}),
     ("mc-certain-ltc", {"mc_ltc_prob": 1.0}),
+    ("mc-cover-needs", {"shortfall_mode": "Withdraw enough to cover needs"}),
 ]
 
 # MC Outcomes column -> shadow-model key
@@ -159,6 +174,13 @@ def main():
     xl.DisplayAlerts = False
     xl.UserName = "Retirement Planner"
     wb = xl.Workbooks.Open(BOOK)
+    # Manual calculation lets each scenario recalculate only the sheets it reads.
+    # CalculateFullRebuild() rebuilds the 71,000-row Monte Carlo engine every time,
+    # which the 40 deterministic scenarios never look at — that alone was ~90% of
+    # the run time. Under-calculating would surface as mismatches, never as a false
+    # pass, because the shadow model is reconfigured for every scenario.
+    xlManual, xlAutomatic = -4135, -4105
+    xl.Calculation = xlManual
     try:
         sh = wb.Worksheets("Inputs & Summary")
         # locate every input cell by its label text
@@ -180,6 +202,23 @@ def main():
         last_row = V.R0 + N_ROWS - 1
         le_last = 6 + len(V.AGES) - 1
 
+        def recalc_deterministic():
+            """Recalculate in dependency order.
+
+            The chain runs: Monte Carlo (bond allocation = 1 - stock) -> Historical
+            Returns (blended column) -> Life Expectancy -> 4% Rule -> Dynamic Strategy.
+            Excel's own Calculate() on a sheet uses whatever the other sheets currently
+            hold, so this order is load-bearing; getting it wrong reads stale values.
+            The first two are only needed by the Monte Carlo scenarios but cost almost
+            nothing (one cell and 98 rows), so they run every time rather than being a
+            special case someone can forget.
+            """
+            wb.Worksheets("Monte Carlo").Calculate()
+            wb.Worksheets("Historical Returns").Calculate()
+            lesh.Calculate()
+            fr.Calculate()
+            dysh.Calculate()
+
         def near(a, b):
             if a is None or b is None:
                 return False
@@ -191,7 +230,7 @@ def main():
                 sh.Cells(row, 3).Value = spec.DEFAULTS[key]
             for key, val in overrides.items():
                 sh.Cells(addr[key], 3).Value = val
-            xl.CalculateFullRebuild()
+            recalc_deterministic()
 
             V.configure(overrides)
             shared = V.four_rule()
@@ -278,9 +317,19 @@ def main():
         for name, overrides in MC_SCENARIOS:
             for key, row in mc_addr.items():
                 mcsh.Cells(row, 3).Value = spec.DEFAULTS[key]
+            for key, row in addr.items():
+                sh.Cells(row, 3).Value = spec.DEFAULTS[key]
+            # an override may target either sheet, so route it by where the key lives
             for key, val in overrides.items():
-                mcsh.Cells(mc_addr[key], 3).Value = val
-            xl.CalculateFullRebuild()
+                if key in mc_addr:
+                    mcsh.Cells(mc_addr[key], 3).Value = val
+                else:
+                    sh.Cells(addr[key], 3).Value = val
+            # the Monte Carlo scenarios do need the engine, so calculate it too
+            recalc_deterministic()
+            engine = wb.Worksheets("MC Engine")
+            engine.Calculate()
+            outsh.Calculate()
 
             V.configure(overrides)
             expected = V.monte_carlo()
@@ -308,6 +357,7 @@ def main():
             mcsh.Cells(row, 3).Value = spec.DEFAULTS[key]
         for key, row in addr.items():
             sh.Cells(row, 3).Value = spec.DEFAULTS[key]
+        xl.Calculation = xlAutomatic
         xl.CalculateFullRebuild()
         wb.Save()
     finally:

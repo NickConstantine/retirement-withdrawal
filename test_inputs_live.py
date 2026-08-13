@@ -61,6 +61,7 @@ CASES = [
     ("ceiling_mult", {"ceiling_basis": "Age-graduated"}, 1.4),
     ("shock", {}, 0.02),
     ("shock_basis", {"scenario": "Early crash"}, "Nominal"),
+    ("shortfall_mode", {}, "Withdraw enough to cover needs"),
     ("current_4pct", {}, 150_000),
     ("tax_early", {}, 0.25),
     ("tax_ss", {}, 0.30),

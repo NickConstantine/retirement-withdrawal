@@ -5,7 +5,13 @@
 # The pattern also covers manually saved copies (…v2.xlsx, …copy.xlsx, and so on);
 # the small hand-built v1 original is kept as an explicit exception.
 Retirement Withdrawal Strategies Planner*.xlsx
-!Retirement Withdrawal Strategies Planner (v1 - original).xlsx
+!/Retirement Withdrawal Strategies Planner (v1 - original).xlsx
+
+# Local archive of superseded builds — kept on disk, never in history.
+old XLS files/
+
+# Output of test_scenarios.py when piped through Tee-Object.
+suite_run.log
 
 # Excel lock files, created while the workbook is open
 ~$*.xlsx

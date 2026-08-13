@@ -302,6 +302,16 @@ shock_basis = IB.add("Shock absorber applies to", spec.DEFAULTS["shock_basis"], 
                      "inflation, so a 5% cut is a 5% cut in buying power. Nominal: the band is "
                      "applied to raw dollars, which at 3% inflation is really +1.9% / -7.8%.",
                      choices=["Real", "Nominal"])
+shortfall_mode = IB.add("If the Dynamic Strategy rule falls short of spending needs",
+                        spec.DEFAULTS["shortfall_mode"], "General", None,
+                        "Follow the rule: withdraw exactly what the strategy says and record a "
+                        "shortfall. The portfolio is protected; your standard of living absorbs "
+                        "the risk. Withdraw enough to cover needs: take out whatever it takes to "
+                        "fund your needs after tax, even when that exceeds the guardrails. Your "
+                        "spending is protected; the portfolio absorbs the risk — and can now run "
+                        "out, which is why 'money lasts' only becomes a meaningful test in this "
+                        "mode. Neither removes risk; they choose where it lands. Run both.",
+                        choices=["Follow the rule", "Withdraw enough to cover needs"])
 current_4pct = IB.add("Current 4% rule withdrawal if already retired (today's $/yr; 0 if not)",
                       spec.DEFAULTS["current_4pct"], CUR, "money")
 
@@ -578,6 +588,36 @@ def need_today(year_cell, age_cell):
 
 
 GROWTH = f"((1+{{r}})*(1-{q(fee)}))"
+
+
+def required_gross(tx, td, basis, ord_cell, need_today_cell, index_cell, ss_cell):
+    """Smallest gross withdrawal that nets the year's spending need after tax.
+
+    Sourcing is taxable -> traditional -> Roth, and each layer nets a different
+    fraction of every dollar taken, so the answer is piecewise. Rather than solve
+    the algebra (easy to get sign-wrong), this walks the layers directly:
+
+        net available from taxable      a = tx * (1 - gain x capital-gains rate)
+        net available from traditional  b = td * (1 - ordinary rate)
+
+    then takes what is needed from each in turn and grosses each slice back up by
+    its own tax factor. Roth is tax-free, so its slice grosses up 1:1.
+    """
+    gcg = f"{gain_fraction(tx, basis)}*{q(cg_rate)}"
+    a = f"{tx}*(1-{gcg})"
+    b = f"{td}*(1-{ord_cell})"
+    short = (f"MAX({need_today_cell}*{index_cell}"
+             f"-{ss_cell}*(1-{spec.SS_TAXABLE_SHARE}*{ord_cell}),0)")
+    return (f"MIN({short},{a})/(1-{gcg})"
+            f"+MIN(MAX({short}-{a},0),{b})/(1-{ord_cell})"
+            f"+MAX({short}-{a}-{b},0)")
+
+
+def apply_shortfall_floor(rule_cell, required, total_cell):
+    """The rule's withdrawal, optionally floored at what the spending need requires,
+    and always capped at the balance actually available."""
+    return (f'MIN(IF({q(shortfall_mode)}="Withdraw enough to cover needs",'
+            f'MAX({rule_cell},{required}),{rule_cell}),{total_cell})')
 
 
 # ===================================================================
@@ -887,7 +927,7 @@ for k in range(spec.TABLE_ROWS):
 fr.conditional_formatting.add(f"AE{R0}:AE{RN}", red_rule)
 fr.conditional_formatting.add(
     f"Z{R0}:Z{RN}",
-    FormulaRule(formula=[f"AND(Z{R0}<0,A{R0}<={HORIZON})"],
+    FormulaRule(formula=[f"AND(Z{R0}<-{spec.SHORTFALL_TOL},A{R0}<={HORIZON})"],
                 fill=PatternFill("solid", start_color=RED_FILL),
                 font=Font(name=ARIAL, color=RED_FONT)))
 
@@ -1003,7 +1043,11 @@ for k in range(spec.TABLE_ROWS):
         step = f'IF({q(shock_basis)}="Real",(1+E{p}),1)'
         prev = f"P{p}*{step}"
         dy.cell(r_, 15, f"=MIN({prev}*(1+{q(shock)}),MAX({prev}*(1-{q(shock)}),N{r_}))")
-    dy.cell(r_, 16, f"=MIN(O{r_},L{r_})").font = font(bold=True)
+    # The spending floor can reference columns further right (need, Social Security):
+    # those depend only on the year and age, so there is no circular reference.
+    req = required_gross(f"H{r_}", f"I{r_}", f"K{r_}", f"G{r_}",
+                         f"AC{r_}", f"F{r_}", f"Y{r_}")
+    dy.cell(r_, 16, "=" + apply_shortfall_floor(f"O{r_}", req, f"L{r_}")).font = font(bold=True)
     c = dy.cell(r_, 17, f"=IFERROR(P{r_}/L{r_},0)")
     c.font = font()
     c.number_format = PCT2
@@ -1047,7 +1091,7 @@ for k in range(spec.TABLE_ROWS):
 dy.conditional_formatting.add(f"AI{R0}:AI{RN}", red_rule)
 dy.conditional_formatting.add(
     f"AD{R0}:AD{RN}",
-    FormulaRule(formula=[f"AND(AD{R0}<0,A{R0}<={HORIZON})"],
+    FormulaRule(formula=[f"AND(AD{R0}<-{spec.SHORTFALL_TOL},A{R0}<={HORIZON})"],
                 fill=PatternFill("solid", start_color=RED_FILL),
                 font=Font(name=ARIAL, color=RED_FONT)))
 
@@ -1229,6 +1273,7 @@ eng_headers = [
     "Dyn taxable", "Dyn traditional", "Dyn Roth", "Dyn basis", "Dyn total",
     "Dyn withdrawal", "Dyn after-tax (today's $)",
     "Return draw", "Inflation draw", "Historical row", "LTC draw", "Dyn withdrawal change",
+    "Social Security", "Dyn required gross",
 ]
 for col, name in enumerate(eng_headers, start=1):
     header_cell(engine.cell(4, col), name)
@@ -1273,15 +1318,14 @@ def roll_accounts(engine_ws, row, prev, tx, td, rt, bs, w, cols, ord_col="H"):
                    f"=MAX({bs}{prev}*IF({tx}{prev}>0,1-{f_tx}/{tx}{prev},0)+{reinv}+{div},0)")
 
 
-def after_tax_income(row, tx, td, bs, w, ord_col="H"):
+def after_tax_income(row, tx, td, bs, w, ord_col="H", ss_col="AD"):
     """Spendable income: withdrawal less its tax, plus Social Security less its tax.
     The RMD excess is withdrawn but not spent, so its tax is excluded here."""
     f_tx = from_taxable(f"{w}{row}", f"{tx}{row}")
     f_td = from_traditional(f"{w}{row}", f"{tx}{row}", f"{td}{row}")
     gain = gain_fraction(f"{tx}{row}", f"{bs}{row}")
-    ss = ss_gross(f"C{row}", f"F{row}")
     return (f"=({w}{row}-({f_tx}*{gain}*{q(cg_rate)}+{f_td}*{ord_col}{row})"
-            f"+{ss}*(1-{spec.SS_TAXABLE_SHARE}*{ord_col}{row}))/F{row}")
+            f"+{ss_col}{row}*(1-{spec.SS_TAXABLE_SHARE}*{ord_col}{row}))/F{row}")
 
 
 for sim in range(1, spec.MAX_SIMS + 1):
@@ -1309,6 +1353,9 @@ for sim in range(1, spec.MAX_SIMS + 1):
         engine.cell(r_, 7, "=" + planning_years(f"C{r_}"))
         engine.cell(r_, 8, "=" + ord_rate(f"C{r_}"))
         engine.cell(r_, 9, "=" + mc_need.format(r=r_))
+        # Social Security gets its own column: the spending floor references it three
+        # times, so inlining it would triple the formula text across 71,000 rows.
+        engine.cell(r_, 30, "=" + ss_gross(f"C{r_}", f"F{r_}"))
 
         # ---- 4% rule: J K L M state, N total, O target, P withdrawal, Q after-tax
         if year == 1:
@@ -1334,17 +1381,19 @@ for sim in range(1, spec.MAX_SIMS + 1):
         else:
             roll_accounts(engine, r_, p, "R", "S", "T", "U", "W", (18, 19, 20, 21))
         engine.cell(r_, 22, f"=R{r_}+S{r_}+T{r_}")
+        engine.cell(r_, 31, "=" + required_gross(f"R{r_}", f"S{r_}", f"U{r_}", f"H{r_}",
+                                                 f"I{r_}", f"F{r_}", f"AD{r_}"))
         guarded = (f"MIN({ceiling_at(f'C{r_}')}*V{r_},"
                    f"MAX({q(floor)}*V{r_},V{r_}/MAX(G{r_},0.5)))")
         if year == 1:
-            engine.cell(r_, 23, f"=MIN({guarded},V{r_})")
+            engine.cell(r_, 23, "=" + apply_shortfall_floor(f"({guarded})", f"AE{r_}", f"V{r_}"))
             engine.cell(r_, 29, 0)
         else:
             step = f'IF({q(shock_basis)}="Real",(1+E{p}),1)'
             prev_w = f"W{p}*{step}"
-            engine.cell(r_, 23,
-                        f"=MIN(MIN({prev_w}*(1+{q(shock)}),"
-                        f"MAX({prev_w}*(1-{q(shock)}),{guarded})),V{r_})")
+            rule = (f"MIN({prev_w}*(1+{q(shock)}),"
+                    f"MAX({prev_w}*(1-{q(shock)}),{guarded}))")
+            engine.cell(r_, 23, "=" + apply_shortfall_floor(f"({rule})", f"AE{r_}", f"V{r_}"))
             engine.cell(r_, 29, f"=IF(W{p}>0,W{r_}/W{p}-1,0)")
         engine.cell(r_, 24, after_tax_income(r_, "R", "S", "U", "W"))
 
@@ -1376,12 +1425,12 @@ for sim in range(1, spec.MAX_SIMS + 1):
     deflator = f"INDEX('MC Engine'!$F${f0}:$F${f1},{END_POS})"
     outcomes.cell(r_, 1, sim)
     outcomes.cell(r_, 2, f"=--({four_end}>0)")
-    outcomes.cell(r_, 3, f"=--(SUMPRODUCT(({rng_('Q')}<{rng_('I')})*1)=0)")
+    outcomes.cell(r_, 3, f"=--(SUMPRODUCT(({rng_('Q')}<{rng_('I')}-{spec.SHORTFALL_TOL})*1)=0)")
     outcomes.cell(r_, 4, f"={four_end}/({deflator})")
     outcomes.cell(r_, 5, f"=MIN({rng_('Q')})")
     outcomes.cell(r_, 6, f"=SUM({rng_('Q')})")
     outcomes.cell(r_, 7, f"=--({dyn_end}>0)")
-    outcomes.cell(r_, 8, f"=--(SUMPRODUCT(({rng_('X')}<{rng_('I')})*1)=0)")
+    outcomes.cell(r_, 8, f"=--(SUMPRODUCT(({rng_('X')}<{rng_('I')}-{spec.SHORTFALL_TOL})*1)=0)")
     outcomes.cell(r_, 9, f"={dyn_end}/({deflator})")
     outcomes.cell(r_, 10, f"=MIN({rng_('X')})")
     outcomes.cell(r_, 11, f"=SUM({rng_('X')})")
@@ -1389,8 +1438,8 @@ for sim in range(1, spec.MAX_SIMS + 1):
     outcomes.cell(r_, 12,
                   f"=MIN('MC Engine'!$AC${f0 + 1}:INDEX('MC Engine'!$AC${f0 + 1}:$AC${f1},"
                   f"MAX({MC_POS}-1,1)))")
-    outcomes.cell(r_, 13, f"=SUMPRODUCT(({rng_('Q')}>={rng_('I')})*1)/{MC_POS}")
-    outcomes.cell(r_, 14, f"=SUMPRODUCT(({rng_('X')}>={rng_('I')})*1)/{MC_POS}")
+    outcomes.cell(r_, 13, f"=SUMPRODUCT(({rng_('Q')}>={rng_('I')}-{spec.SHORTFALL_TOL})*1)/{MC_POS}")
+    outcomes.cell(r_, 14, f"=SUMPRODUCT(({rng_('X')}>={rng_('I')}-{spec.SHORTFALL_TOL})*1)/{MC_POS}")
     for col in (4, 5, 6, 9, 10, 11):
         outcomes.cell(r_, col).number_format = CUR
     outcomes.cell(r_, 12).number_format = PCT
@@ -1527,10 +1576,10 @@ res("Net expected return after fees",
 
 res("— DOES THE PLAN WORK? —", None, section=True)
 res("Dynamic: essentials covered every year?",
-    f'=IF(SUMPRODUCT(({D_}$A${R0}:$A${RN}<={HORIZON})*({D_}$AD${R0}:$AD${RN}<0))=0,"YES","NO")',
+    f'=IF(SUMPRODUCT(({D_}$A${R0}:$A${RN}<={HORIZON})*({D_}$AD${R0}:$AD${RN}<-{spec.SHORTFALL_TOL}))=0,"YES","NO")',
     "General", BLACK, bold=True, key="dyn_ess")
 res("4% rule: essentials covered every year?",
-    f'=IF(SUMPRODUCT(({F_}$A${R0}:$A${RN}<={HORIZON})*({F_}$Z${R0}:$Z${RN}<0))=0,"YES","NO")',
+    f'=IF(SUMPRODUCT(({F_}$A${R0}:$A${RN}<={HORIZON})*({F_}$Z${R0}:$Z${RN}<-{spec.SHORTFALL_TOL}))=0,"YES","NO")',
     "General", BLACK, bold=True, key="four_ess")
 
 res("— DYNAMIC STRATEGY —", None, section=True, space=True)
@@ -1542,10 +1591,10 @@ res("Highest annual after-tax income (today's $)",
 res("Lifetime after-tax income (today's $)",
     f"=SUM({rng_to_horizon(D_, 'AB')})", CUR, GREEN, key="dyn_total")
 res("Years spending falls short of needs",
-    f"=SUMPRODUCT(({D_}$A${R0}:$A${RN}<={HORIZON})*({D_}$AD${R0}:$AD${RN}<0))",
+    f"=SUMPRODUCT(({D_}$A${R0}:$A${RN}<={HORIZON})*({D_}$AD${R0}:$AD${RN}<-{spec.SHORTFALL_TOL}))",
     NUM, BLACK, key="dyn_short")
 res("Share of years essentials are covered",
-    f"=1-SUMPRODUCT(({D_}$A${R0}:$A${RN}<={HORIZON})*({D_}$AD${R0}:$AD${RN}<0))/{HORIZON}",
+    f"=1-SUMPRODUCT(({D_}$A${R0}:$A${RN}<={HORIZON})*({D_}$AD${R0}:$AD${RN}<-{spec.SHORTFALL_TOL}))/{HORIZON}",
     PCT, BLACK, key="dyn_share")
 res("Real income at plan-to age vs. year 1",
     f"={idx(D_, 'AB')}/{D_}$AB${R0}-1", PCT, BLACK, key="dyn_decay")
@@ -1592,10 +1641,10 @@ res("Lowest annual after-tax income (today's $)",
 res("Lifetime after-tax income (today's $)",
     f"=SUM({rng_to_horizon(F_, 'X')})", CUR, GREEN, key="four_total")
 res("Years spending falls short of needs",
-    f"=SUMPRODUCT(({F_}$A${R0}:$A${RN}<={HORIZON})*({F_}$Z${R0}:$Z${RN}<0))",
+    f"=SUMPRODUCT(({F_}$A${R0}:$A${RN}<={HORIZON})*({F_}$Z${R0}:$Z${RN}<-{spec.SHORTFALL_TOL}))",
     NUM, BLACK, key="four_short")
 res("Share of years essentials are covered",
-    f"=1-SUMPRODUCT(({F_}$A${R0}:$A${RN}<={HORIZON})*({F_}$Z${R0}:$Z${RN}<0))/{HORIZON}",
+    f"=1-SUMPRODUCT(({F_}$A${R0}:$A${RN}<={HORIZON})*({F_}$Z${R0}:$Z${RN}<-{spec.SHORTFALL_TOL}))/{HORIZON}",
     PCT, BLACK, key="four_share")
 res("Balance at plan-to age (today's $)", f"={idx(F_, 'AF')}", CUR, GREEN, key="four_bal")
 res("Money lasts to plan-to age?", f'=IF({idx(F_, "AE")}>0,"YES","NO")', "General", BLACK,
@@ -1830,6 +1879,29 @@ instructions = [
     ("p", "Remember that life expectancy is an average: about half of people outlive it. The "
           "dynamic rule handles this gracefully because it recalculates every year and the "
           "divisor never reaches zero, but it does mean spending is front-loaded."),
+    ("h2", "When the rule falls short: where you put the risk"),
+    ("p", "The dynamic strategy never looks at what you need. It computes a withdrawal from "
+          "your balance and your remaining years, and your spending need is used only "
+          "afterwards, to judge the result. That is why changing your essential spending "
+          "moves the shortfall count but does not move the ending balance by a single dollar."),
+    ("p", "The input \"If the Dynamic Strategy rule falls short of spending needs\" lets you "
+          "choose what happens when the rule produces less than you need:"),
+    ("p", "   • Follow the rule (default) — you accept the cut. The portfolio is protected and "
+          "your standard of living absorbs the risk. This is the strategy as its authors "
+          "describe it."),
+    ("p", "   • Withdraw enough to cover needs — you take out whatever it takes to fund your "
+          "needs after tax, even when that breaks the guardrails. Your spending is protected "
+          "and the portfolio absorbs the risk."),
+    ("p", "Neither setting removes risk. They decide where it lands. Run the plan both ways: "
+          "the first tells you how much your lifestyle might have to bend, the second tells you "
+          "how likely the money is to run out if it does not. The truth is in between, because "
+          "in practice you can flex holidays but not health insurance or nursing care."),
+    ("p", "One consequence worth knowing: \"Money lasts to plan-to age\" is close to meaningless "
+          "in Follow the rule mode. A strategy that spends a percentage of whatever is left can "
+          "almost never reach zero, so it passes that test by construction. Only in Withdraw "
+          "enough to cover needs mode — where a bad year forces a withdrawal above what the "
+          "guardrails would allow — can the portfolio genuinely deplete, which is what makes "
+          "the survival number worth reading at all."),
     ("h2", "Guardrails and the shock absorber"),
     ("p", "Each year the raw actuarial withdrawal is capped inside your floor/ceiling band, then "
           "limited by the shock absorber. Note the order: the shock absorber runs last, so in a "
