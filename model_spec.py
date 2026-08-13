@@ -132,6 +132,7 @@ DEFAULTS = {
     "healthcare": 20_000,
     "drift": 0.0,
     "rate4": 0.04,
+    "fixed_basis": "4% of starting portfolio",
     "floor": 0.03,
     "ceiling": 0.06,
     "ceiling_basis": "Age-graduated",
@@ -175,3 +176,10 @@ INFLATION_FLOOR = -0.05          # parametric inflation draws are floored here
 # zero to within floating-point dust. Without a tolerance, Excel and Python round those
 # to opposite sides and disagree about whether the year was funded.
 SHORTFALL_TOL = 1.0
+
+# The two tabs are named here so the builder and both test harnesses cannot disagree
+# about them. The fixed-spending tab is no longer only the 4% rule: with the needs
+# basis it targets your actual spending instead of a percentage of the opening balance.
+FIXED_SHEET = "Fixed Spending"
+BASIS_PCT = "4% of starting portfolio"
+BASIS_NEEDS = "Your actual spending needs"

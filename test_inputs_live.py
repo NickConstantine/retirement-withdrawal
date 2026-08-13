@@ -55,6 +55,7 @@ CASES = [
     ("healthcare", {}, 35_000),
     ("drift", {}, -0.01),
     ("rate4", {}, 0.05),
+    ("fixed_basis", {}, spec.BASIS_NEEDS),
     ("floor", {"ceiling_basis": "Fixed %"}, 0.045),
     ("ceiling", {"ceiling_basis": "Fixed %"}, 0.05),
     ("ceiling_basis", {}, "Fixed %"),

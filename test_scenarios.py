@@ -46,6 +46,7 @@ LABEL_TO_KEY = {
     "Essential annual spending (today's $, after tax)": "essential",
     "Extra healthcare premiums before age 65 (today's $/yr)": "healthcare",
     "Real spending drift per year (spending smile)": "drift",
+    "Fixed Spending target basis": "fixed_basis",
     "4% rule starting rate": "rate4",
     "Guardrail floor (minimum withdrawal rate)": "floor",
     "Guardrail ceiling (maximum withdrawal rate)": "ceiling",
@@ -127,6 +128,24 @@ SCENARIOS = [
                            "essential": 50_000, "healthcare": 0}),
     ("cover-needs-ruinous", {"shortfall_mode": "Withdraw enough to cover needs",
                              "essential": 400_000}),
+    ("needs-basis", {"fixed_basis": spec.BASIS_NEEDS}),
+    ("needs-basis-crash", {"fixed_basis": spec.BASIS_NEEDS, "scenario": "Early crash"}),
+    ("needs-basis-stagflation", {"fixed_basis": spec.BASIS_NEEDS, "scenario": "Stagflation"}),
+    ("needs-basis-all-traditional", {"fixed_basis": spec.BASIS_NEEDS,
+                                     "taxable0": 0, "traditional0": 3_500_000, "roth0": 0}),
+    ("needs-basis-all-roth", {"fixed_basis": spec.BASIS_NEEDS,
+                              "taxable0": 0, "traditional0": 0, "roth0": 3_500_000}),
+    ("needs-basis-ruinous", {"fixed_basis": spec.BASIS_NEEDS, "essential": 400_000}),
+    ("needs-basis-cheap", {"fixed_basis": spec.BASIS_NEEDS, "essential": 40_000,
+                           "healthcare": 0, "ltc_on": "No"}),
+    # current_4pct must be ignored on the needs basis; if it leaked in, the year-1
+    # target would be this number instead of the solved requirement.
+    ("needs-basis-ignores-current", {"fixed_basis": spec.BASIS_NEEDS,
+                                     "current_4pct": 250_000}),
+    ("needs-basis-with-ltc", {"fixed_basis": spec.BASIS_NEEDS, "ltc_on": "Yes",
+                              "ltc_cost": 250_000, "ltc_years": 6, "ltc_age": 80}),
+    ("needs-basis-both-floors", {"fixed_basis": spec.BASIS_NEEDS,
+                                 "shortfall_mode": "Withdraw enough to cover needs"}),
 ]
 
 # Monte Carlo inputs live on the Monte Carlo sheet, not Inputs & Summary, which is
@@ -150,6 +169,11 @@ MC_SCENARIOS = [
     ("mc-high-volatility", {"mc_vol": 0.25, "mc_infl_vol": 0.06}),
     ("mc-certain-ltc", {"mc_ltc_prob": 1.0}),
     ("mc-cover-needs", {"shortfall_mode": "Withdraw enough to cover needs"}),
+    # the needs basis is what turns the Fixed Spending block into a direct
+    # "will my portfolio hold?" test, so it needs its own MC coverage
+    ("mc-needs-basis", {"fixed_basis": spec.BASIS_NEEDS}),
+    ("mc-needs-basis-historical", {"fixed_basis": spec.BASIS_NEEDS,
+                                   "mc_method": "Historical bootstrap"}),
 ]
 
 # MC Outcomes column -> shadow-model key
@@ -196,7 +220,7 @@ def main():
             print(f"FAILED to locate input rows for: {sorted(missing)}")
             return 1
 
-        fr = wb.Worksheets("4% Rule")
+        fr = wb.Worksheets(spec.FIXED_SHEET)
         dysh = wb.Worksheets("Dynamic Strategy")
         lesh = wb.Worksheets("Life Expectancy")
         last_row = V.R0 + N_ROWS - 1
@@ -206,7 +230,7 @@ def main():
             """Recalculate in dependency order.
 
             The chain runs: Monte Carlo (bond allocation = 1 - stock) -> Historical
-            Returns (blended column) -> Life Expectancy -> 4% Rule -> Dynamic Strategy.
+            Returns (blended column) -> Life Expectancy -> Fixed Spending -> Dynamic Strategy.
             Excel's own Calculate() on a sheet uses whatever the other sheets currently
             hold, so this order is load-bearing; getting it wrong reads stale values.
             The first two are only needed by the Monte Carlo scenarios but cost almost
@@ -268,7 +292,7 @@ def main():
             for k in range(N_ROWS):
                 for ci, letter in enumerate(COLS4):
                     if not near(four_vals[k][ci], shared[k][letter]):
-                        fails.append(f"4%!{letter}{V.R0+k}: shadow {shared[k][letter]!r} "
+                        fails.append(f"FIXED!{letter}{V.R0+k}: shadow {shared[k][letter]!r} "
                                      f"vs excel {four_vals[k][ci]!r}")
                 for ci, letter in enumerate(COLSD):
                     if not near(dyn_vals[k][ci], dyn[k][letter]):
@@ -284,7 +308,7 @@ def main():
                              f"(plan-to {V.D['plan_age']})")
 
             status = "OK  " if not fails else "FAIL"
-            print(f"  [{status}] {name:<26} horizon={horizon:>3}  "
+            print(f"  [{status}] {name:<30} horizon={horizon:>3}  "
                   f"dyn yr1 after-tax={dyn[0]['AB']:>10,.0f}  "
                   f"balance@plan={dyn[horizon - 1]['AJ']:>13,.0f}")
             for f in fails[:6]:
@@ -346,8 +370,11 @@ def main():
             status = "OK  " if not fails else "FAIL"
             surv = sum(e["dyn_lasts"] for e in expected) / len(expected)
             ess = sum(e["dyn_ess"] for e in expected) / len(expected)
-            print(f"  [{status}] {name:<26} dyn lasts={surv:>6.1%}  "
-                  f"essentials met={ess:>6.1%}")
+            fsurv = sum(e["four_lasts"] for e in expected) / len(expected)
+            fess = sum(e["four_ess"] for e in expected) / len(expected)
+            print(f"  [{status}] {name:<30} dyn lasts={surv:>6.1%}  "
+                  f"essentials met={ess:>6.1%}   |   fixed lasts={fsurv:>6.1%}  "
+                  f"essentials met={fess:>6.1%}")
             for f in fails[:6]:
                 print(f"           {f}")
             total_fail += len(fails)

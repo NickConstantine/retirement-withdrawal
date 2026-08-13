@@ -256,7 +256,7 @@ def scen_infl(year):
     return D["infl"]
 
 
-# ---------------------------------------------------------------- 4% rule
+# ---------------------------------------------------------------- fixed spending
 def four_rule():
     rows = []
     for k in range(N):
@@ -271,7 +271,7 @@ def four_rule():
             i = D["roth0"]
             j = D["taxable0"] * D["basis_share"]
             kk = g_ + h + i
-            l = D["current_4pct"] if D["current_4pct"] > 0 else kk * D["rate4"]
+            pct = D["current_4pct"] if D["current_4pct"] > 0 else kk * D["rate4"]
         else:
             pr = rows[-1]
             e = pr["E"] * (1 + pr["D"])
@@ -280,8 +280,14 @@ def four_rule():
             i = max(pr["AC"], 0.0)
             j = max(pr["AD"], 0.0)
             kk = g_ + h + i
-            l = pr["L"] * (1 + pr["D"])
+            pct = pr["L"] * (1 + pr["D"])
         f = ord_rate(age)
+        u = D["full_ss"] * ss_factor() * e if age >= D["ss_age"] else 0.0
+        y = need_today(yr, age)
+        # The basis is a single global input, so the whole column is either the
+        # inflation-grown percentage chain or a fresh needs solve every year.
+        l = (required_gross(g_, h, j, f, y * e, u) if D["fixed_basis"] == spec.BASIS_NEEDS
+             else pct)
         m = min(l, kk)
         st = step_accounts(age, g_, h, i, j, m, c)
         n, o, p_ = st["f_tx"], st["f_td"], st["f_rt"]
@@ -289,11 +295,9 @@ def four_rule():
         r = st["rmd_extra"]
         s = st["tax_wd"]
         t = st["div_tax"]
-        u = D["full_ss"] * ss_factor() * e if age >= D["ss_age"] else 0.0
         v = u * spec.SS_TAXABLE_SHARE * f
         w = m - st["tax_spend"] + u - v
         x = w / e
-        y = need_today(yr, age)
         z = x - y
         rows.append(dict(A=yr, B=age, C=c, D=d, E=e, F=f, G=g_, H=h, I=i, J=j, K=kk, L=l,
                          M=m, N=n, O=o, P=p_, Q=qq, R=r, S=s, T=t, U=u, V=v, W=w, X=x,
@@ -378,8 +382,8 @@ def monte_carlo():
         f_tx, f_td, f_rt, f_bs = (D["taxable0"], D["traditional0"], D["roth0"],
                                   D["taxable0"] * D["basis_share"])
         d_tx, d_td, d_rt, d_bs = f_tx, f_td, f_rt, f_bs
-        f_target = (D["current_4pct"] if D["current_4pct"] > 0
-                    else (f_tx + f_td + f_rt) * D["rate4"])
+        f_pct = (D["current_4pct"] if D["current_4pct"] > 0
+                 else (f_tx + f_td + f_rt) * D["rate4"])
         d_prev = None
         index = 1.0
         f_sp, d_sp, needs, changes = [], [], [], []
@@ -399,8 +403,18 @@ def monte_carlo():
             pyrs = plan_years(age)
             o = ord_rate(age)
             ss = D["full_ss"] * ss_factor() * index if age >= D["ss_age"] else 0.0
-            # 4% rule
+            # the spending need is shared by both strategies (engine column I)
+            nd = D["essential"] * (1 + D["drift"]) ** (y - 1)
+            if age < 65:
+                nd += D["healthcare"]
+            if (D["ltc_on"] == "Yes" and ltc_u < D["mc_ltc_prob"]
+                    and D["ltc_age"] <= age < D["ltc_age"] + D["ltc_years"]):
+                nd += D["ltc_cost"]
+            needs.append(nd)
+            # fixed spending
             f_total = f_tx + f_td + f_rt
+            f_target = (required_gross(f_tx, f_td, f_bs, o, nd * index, ss)
+                        if D["fixed_basis"] == spec.BASIS_NEEDS else f_pct)
             w4 = min(f_target, f_total)
             st4 = step_accounts(age, f_tx, f_td, f_rt, f_bs, w4, ret)
             f_sp.append((w4 - st4["tax_spend"]
@@ -409,13 +423,6 @@ def monte_carlo():
             d_total = d_tx + d_td + d_rt
             guarded = min(ceiling_for(age) * d_total,
                           max(D["floor"] * d_total, d_total / max(pyrs, 0.5)))
-            nd = D["essential"] * (1 + D["drift"]) ** (y - 1)
-            if age < 65:
-                nd += D["healthcare"]
-            if (D["ltc_on"] == "Yes" and ltc_u < D["mc_ltc_prob"]
-                    and D["ltc_age"] <= age < D["ltc_age"] + D["ltc_years"]):
-                nd += D["ltc_cost"]
-            needs.append(nd)
             req = required_gross(d_tx, d_td, d_bs, o, nd * index, ss)
             if d_prev is None:
                 wd = apply_shortfall_floor(guarded, req, d_total)
@@ -433,7 +440,7 @@ def monte_carlo():
             f_tx, f_td, f_rt, f_bs = st4["ntx"], st4["ntd"], st4["nrt"], st4["nbasis"]
             d_tx, d_td, d_rt, d_bs = std["ntx"], std["ntd"], std["nrt"], std["nbasis"]
             d_prev = wd
-            f_target = f_target * (1 + inf)
+            f_pct = f_pct * (1 + inf)
             last_infl = inf
             index = index * (1 + inf)
         # the balance "at plan-to age" is the opening balance of the following year
@@ -500,15 +507,15 @@ def main():
         ck.eq(f"LE!L{r}", PLANNING[age], le.cell(r, 12).value, 1e-9)
         ck.eq(f"LE!M{r}", ceiling_for(age), le.cell(r, 13).value, 1e-9)
 
-    # ---- 4% Rule tab ----
-    fr = wb["4% Rule"]
+    # ---- Fixed Spending tab ----
+    fr = wb[spec.FIXED_SHEET]
     cols4 = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O",
              "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z", "AA", "AB", "AC",
              "AD", "AE", "AF"]
     for k, row in enumerate(shared):
         r = R0 + k
         for ci, letter in enumerate(cols4, start=1):
-            ck.eq(f"4%!{letter}{r}", row[letter], fr.cell(r, ci).value)
+            ck.eq(f"FIXED!{letter}{r}", row[letter], fr.cell(r, ci).value)
 
     # ---- Dynamic tab ----
     dysh = wb["Dynamic Strategy"]
@@ -554,7 +561,7 @@ def main():
          (1 + D["exp_ret"]) * (1 - D["fee"]) - 1),
         ("DOES THE PLAN WORK?", "Dynamic: essentials covered every year?",
          "YES" if all(r["AD"] >= -spec.SHORTFALL_TOL for r in dyn_h) else "NO"),
-        ("DOES THE PLAN WORK?", "4% rule: essentials covered every year?",
+        ("DOES THE PLAN WORK?", "Fixed Spending: essentials covered every year?",
          "YES" if all(r["Z"] >= -spec.SHORTFALL_TOL for r in four_h) else "NO"),
         ("DYNAMIC STRATEGY", "First-year after-tax income (today's $)", dyn[0]["AB"]),
         ("DYNAMIC STRATEGY", "Lowest annual after-tax income (today's $)",
@@ -583,17 +590,17 @@ def main():
          exhausted_label(dyn_h, "AF")),
         ("DYNAMIC STRATEGY", "Roth accounts exhausted at",
          exhausted_label(dyn_h, "AG")),
-        ("4% RULE", "First-year after-tax income (today's $)", shared[0]["X"]),
-        ("4% RULE", "Lowest annual after-tax income (today's $)",
+        ("FIXED SPENDING", "First-year after-tax income (today's $)", shared[0]["X"]),
+        ("FIXED SPENDING", "Lowest annual after-tax income (today's $)",
          min(r["X"] for r in four_h)),
-        ("4% RULE", "Lifetime after-tax income (today's $)",
+        ("FIXED SPENDING", "Lifetime after-tax income (today's $)",
          sum(r["X"] for r in four_h)),
-        ("4% RULE", "Years spending falls short of needs",
+        ("FIXED SPENDING", "Years spending falls short of needs",
          sum(1 for r in four_h if r["Z"] < -spec.SHORTFALL_TOL)),
-        ("4% RULE", "Share of years essentials are covered",
+        ("FIXED SPENDING", "Share of years essentials are covered",
          1 - sum(1 for r in four_h if r["Z"] < -spec.SHORTFALL_TOL) / horizon),
-        ("4% RULE", "Balance at plan-to age (today's $)", shared[horizon - 1]["AF"]),
-        ("4% RULE", "Money lasts to plan-to age?",
+        ("FIXED SPENDING", "Balance at plan-to age (today's $)", shared[horizon - 1]["AF"]),
+        ("FIXED SPENDING", "Money lasts to plan-to age?",
          "YES" if shared[horizon - 1]["AE"] > 0 else "NO"),
         ("WHAT YOUR ESSENTIALS COST", "Social Security you will actually receive "
          "(today's $/yr, after tax)",

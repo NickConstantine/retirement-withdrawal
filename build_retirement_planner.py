@@ -96,8 +96,9 @@ for col, width in (("A", 2), ("B", 54), ("C", 16), ("D", 3), ("E", 56), ("F", 16
     ws.column_dimensions[col].width = width
 
 title(ws, "B2", "Retirement Withdrawal Strategies")
-ws["B3"] = ("Compare the classic 4% rule with a dynamic strategy (life expectancy + guardrails + "
-            "shock absorber) — after tax, fees, healthcare, long-term care and RMDs.  "
+ws["B3"] = ("Compare a fixed spending target (the 4% rule, or your actual needs) with a dynamic "
+            "strategy (life expectancy + guardrails + shock absorber) — after tax, fees, "
+            "healthcare, long-term care and RMDs.  "
             "Yellow = edit these · Black = calculated · Green = from another tab.")
 ws["B3"].font = font(italic=True, color="595959", size=9)
 ws.merge_cells("B3:F3")
@@ -274,7 +275,18 @@ drift = IB.add("Real spending drift per year (spending smile)",
                "conservative choice.")
 
 IB.section("STRATEGY SETTINGS")
-rate4 = IB.add("4% rule starting rate", spec.DEFAULTS["rate4"], PCT, "rate")
+fixed_basis = IB.add("Fixed Spending target basis", spec.DEFAULTS["fixed_basis"],
+                     "General", None,
+                     "What the Fixed Spending strategy aims to withdraw each year. "
+                     "4% of starting portfolio: Bengen's rule — 4% of the opening balance in "
+                     "year one, then that dollar amount grown by inflation, regardless of what "
+                     "you actually need. Your actual spending needs: target the withdrawal that "
+                     "funds your essentials, pre-65 healthcare and long-term care AFTER tax, "
+                     "recomputed every year. The needs basis is the honest test of whether the "
+                     "portfolio can pay for your life; the 4% basis is the familiar benchmark.",
+                     choices=[spec.BASIS_PCT, spec.BASIS_NEEDS])
+rate4 = IB.add("4% rule starting rate", spec.DEFAULTS["rate4"], PCT, "rate",
+               "Only used when the basis above is '4% of starting portfolio'.")
 floor = IB.add("Guardrail floor (minimum withdrawal rate)", spec.DEFAULTS["floor"], PCT, "rate")
 ceiling = IB.add("Guardrail ceiling (maximum withdrawal rate)",
                  spec.DEFAULTS["ceiling"], PCT, "rate",
@@ -313,7 +325,10 @@ shortfall_mode = IB.add("If the Dynamic Strategy rule falls short of spending ne
                         "mode. Neither removes risk; they choose where it lands. Run both.",
                         choices=["Follow the rule", "Withdraw enough to cover needs"])
 current_4pct = IB.add("Current 4% rule withdrawal if already retired (today's $/yr; 0 if not)",
-                      spec.DEFAULTS["current_4pct"], CUR, "money")
+                      spec.DEFAULTS["current_4pct"], CUR, "money",
+                      "Continues an existing 4% rule withdrawal instead of restarting it from "
+                      "today's balance. Ignored when the Fixed Spending basis is set to your "
+                      "actual spending needs, which recomputes the target from scratch each year.")
 
 IB.section("TAXES & REQUIRED DISTRIBUTIONS")
 tax_early = IB.add("Effective tax rate — before Social Security starts",
@@ -590,8 +605,23 @@ def need_today(year_cell, age_cell):
 GROWTH = f"((1+{{r}})*(1-{q(fee)}))"
 
 
-def required_gross(tx, td, basis, ord_cell, need_today_cell, index_cell, ss_cell):
-    """Smallest gross withdrawal that nets the year's spending need after tax.
+def net_need(need_today_cell, index_cell, ss_cell, ord_cell):
+    """This year's spending need in nominal dollars, less after-tax Social Security.
+
+    Identical for both strategies — it depends only on the year, the age and the
+    price index — so on the Monte Carlo engine it is computed once and shared.
+    """
+    return (f"MAX({need_today_cell}*{index_cell}"
+            f"-{ss_cell}*(1-{spec.SS_TAXABLE_SHARE}*{ord_cell}),0)")
+
+
+def taxable_net(tx, basis):
+    """After-tax proceeds if the whole taxable account were liquidated."""
+    return f"{tx}*(1-{gain_fraction(tx, basis)}*{q(cg_rate)})"
+
+
+def required_gross(tx, td, basis, ord_cell, short, a=None):
+    """Smallest gross withdrawal that nets `short` after tax.
 
     Sourcing is taxable -> traditional -> Roth, and each layer nets a different
     fraction of every dollar taken, so the answer is piecewise. Rather than solve
@@ -602,12 +632,15 @@ def required_gross(tx, td, basis, ord_cell, need_today_cell, index_cell, ss_cell
 
     then takes what is needed from each in turn and grosses each slice back up by
     its own tax factor. Roth is tax-free, so its slice grosses up 1:1.
+
+    `short` and `a` may be passed as cell references. Both appear three times in
+    the expression, so on the 71,000-row engine referencing a helper column
+    instead of repeating the sub-expression saves tens of megabytes of formula
+    text — enough to matter for how long the workbook takes to open.
     """
     gcg = f"{gain_fraction(tx, basis)}*{q(cg_rate)}"
-    a = f"{tx}*(1-{gcg})"
+    a = a or taxable_net(tx, basis)
     b = f"{td}*(1-{ord_cell})"
-    short = (f"MAX({need_today_cell}*{index_cell}"
-             f"-{ss_cell}*(1-{spec.SS_TAXABLE_SHARE}*{ord_cell}),0)")
     return (f"MIN({short},{a})/(1-{gcg})"
             f"+MIN(MAX({short}-{a},0),{b})/(1-{ord_cell})"
             f"+MAX({short}-{a}-{b},0)")
@@ -786,17 +819,26 @@ def ceiling_at(age_cell):
 
 
 # ===================================================================
-# SHEET: 4% Rule
+# SHEET: Fixed Spending  (the 4% rule, generalised)
 #   Holds the shared return/inflation path that both strategies use.
+#   The target is either 4% of the starting portfolio grown by inflation
+#   (Bengen) or the gross withdrawal that funds your actual needs after tax.
 # ===================================================================
 R0 = 5                                   # first data row on both strategy tabs
 RN = R0 + spec.TABLE_ROWS - 1
 
-fr = wb.create_sheet("4% Rule")
+FIXED = spec.FIXED_SHEET
+FIXED_REF = f"'{FIXED}'!"
+
+fr = wb.create_sheet(FIXED)
 fr.sheet_view.showGridLines = False
-title(fr, "A1", "4% Rule — Year by Year", 14)
-fr["A2"] = ("Year-1 withdrawal is 4% of the starting portfolio; after that the TARGET grows with "
-            "actual inflation (it does not reset downward in a year the portfolio cannot fund it). "
+title(fr, "A1", "Fixed Spending — Year by Year", 14)
+fr["A2"] = ("A target set once and followed regardless of what the portfolio does — the opposite "
+            "of the dynamic strategy. With the 4%-of-starting-portfolio basis the year-1 target "
+            "is 4% of the opening balance and then grows with actual inflation (it does not reset "
+            "downward in a year the portfolio cannot fund it). With the spending-needs basis the "
+            "target is instead whatever it takes to fund that year's needs after tax. Either way "
+            "the withdrawal is capped at the balance available, so this strategy CAN run out. "
             "Returns and inflation come from the Market scenario on the Inputs tab and are shared "
             "with the Dynamic Strategy tab.")
 fr["A2"].font = font(italic=True, color="595959", size=9)
@@ -818,8 +860,11 @@ f_cols = [
     ("Taxable cost basis", 13, "What you paid for the taxable holdings. Value above this is the "
                                "gain that gets taxed when you sell."),
     ("Total beginning balance", 15, "The three accounts combined."),
-    ("Target withdrawal", 14, "The 4% rule target: 4% of the starting portfolio, then grown by "
-                              "actual inflation. It is not reset downward by a lean year."),
+    ("Target withdrawal", 14, "What the strategy is trying to withdraw before the balance limits "
+                              "it. On the 4% basis: 4% of the starting portfolio grown by actual "
+                              "inflation, never reset downward by a lean year. On the needs "
+                              "basis: the gross withdrawal that funds this year's spending need "
+                              "after tax, net of Social Security."),
     ("Gross withdrawal", 14, "The target, capped at the total balance available."),
     ("From taxable", 12, None),
     ("From traditional", 13, None),
@@ -883,10 +928,16 @@ for k in range(spec.TABLE_ROWS):
     fr.cell(r_, 11, f"=G{r_}+H{r_}+I{r_}").font = font()
     # Bengen's target grows with inflation from the previous TARGET, never from a
     # capped actual withdrawal, so one lean year does not permanently cut spending.
+    # On the needs basis the target is re-solved every year instead, so it follows
+    # the age-65 healthcare cliff and any long-term-care years.
+    fixed_req = required_gross(f"G{r_}", f"H{r_}", f"J{r_}", f"F{r_}",
+                               net_need(f"Y{r_}", f"E{r_}", f"U{r_}", f"F{r_}"))
     if k == 0:
-        fr.cell(r_, 12, f"=IF({q(current_4pct)}>0,{q(current_4pct)},K{r_}*{q(rate4)})")
+        pct_target = f"IF({q(current_4pct)}>0,{q(current_4pct)},K{r_}*{q(rate4)})"
     else:
-        fr.cell(r_, 12, f"=L{p}*(1+D{p})")
+        pct_target = f"L{p}*(1+D{p})"
+    fr.cell(r_, 12,
+            f'=IF({q(fixed_basis)}="{spec.BASIS_NEEDS}",{fixed_req},{pct_target})')
     fr.cell(r_, 13, f"=MIN(L{r_},K{r_})").font = font(bold=True)
     fr.cell(r_, 14, "=" + from_taxable(f"M{r_}", f"G{r_}")).font = font()
     fr.cell(r_, 15, "=" + from_traditional(f"M{r_}", f"G{r_}", f"H{r_}")).font = font()
@@ -939,7 +990,7 @@ dy.sheet_view.showGridLines = False
 title(dy, "A1", "Dynamic Strategy — Year by Year", 14)
 dy["A2"] = ("Withdrawal = balance / remaining planning years, held inside the guardrails, then "
             "limited by the shock absorber, then floored by any RMD tax. Returns and inflation "
-            "are linked from the 4% Rule tab so both strategies see identical markets.")
+            "are linked from the Fixed Spending tab so both strategies see identical markets.")
 dy["A2"].font = font(italic=True, color="595959", size=9)
 dy.merge_cells("A2:X2")
 
@@ -949,8 +1000,9 @@ d_cols = [
     ("Planning years", 12, "Remaining life expectancy at this age — last-survivor (joint) years "
                            "if you set Household to Couple. The dynamic withdrawal divides the "
                            "balance by this number."),
-    ("Annual return", 11, "Linked from the 4% Rule tab so both strategies see the same markets."),
-    ("Inflation", 10, "Also linked from the 4% Rule tab."),
+    ("Annual return", 11, "Linked from the Fixed Spending tab so both strategies see the same "
+                          "markets."),
+    ("Inflation", 10, "Also linked from the Fixed Spending tab."),
     ("Price index", 10, "Cumulative inflation since year 1."),
     ("Ordinary tax rate", 11, "Your effective rate for this phase of retirement."),
     ("Taxable beginning", 14, "Brokerage balance. Spent first."),
@@ -1014,13 +1066,13 @@ for k in range(spec.TABLE_ROWS):
     c = dy.cell(r_, 3, "=" + planning_years(f"B{r_}"))
     c.font = font()
     c.number_format = NUM1
-    c = dy.cell(r_, 4, f"='4% Rule'!C{r_}")
+    c = dy.cell(r_, 4, f"={FIXED_REF}C{r_}")
     c.font = font(color=GREEN)
     c.number_format = PCT
-    c = dy.cell(r_, 5, f"='4% Rule'!D{r_}")
+    c = dy.cell(r_, 5, f"={FIXED_REF}D{r_}")
     c.font = font(color=GREEN)
     c.number_format = PCT
-    c = dy.cell(r_, 6, f"='4% Rule'!E{r_}")
+    c = dy.cell(r_, 6, f"={FIXED_REF}E{r_}")
     c.font = font(color=GREEN)
     c.number_format = "0.000"
     c = dy.cell(r_, 7, "=" + ord_rate(f"B{r_}"))
@@ -1046,7 +1098,7 @@ for k in range(spec.TABLE_ROWS):
     # The spending floor can reference columns further right (need, Social Security):
     # those depend only on the year and age, so there is no circular reference.
     req = required_gross(f"H{r_}", f"I{r_}", f"K{r_}", f"G{r_}",
-                         f"AC{r_}", f"F{r_}", f"Y{r_}")
+                         net_need(f"AC{r_}", f"F{r_}", f"Y{r_}", f"G{r_}"))
     dy.cell(r_, 16, "=" + apply_shortfall_floor(f"O{r_}", req, f"L{r_}")).font = font(bold=True)
     c = dy.cell(r_, 17, f"=IFERROR(P{r_}/L{r_},0)")
     c.font = font()
@@ -1104,8 +1156,8 @@ title(cd, "A1", "Chart series (trimmed to the plan horizon)", 12)
 cd["A2"] = ("Values past the plan-to age deliberately return #N/A so the chart lines stop there. "
             "That is expected and is not a formula error.")
 cd["A2"].font = font(italic=True, color="808080", size=8)
-for i, name in enumerate(["Age", "4% balance (today's $)", "Dynamic balance (today's $)",
-                          "4% after-tax income (today's $)",
+for i, name in enumerate(["Age", "Fixed balance (today's $)", "Dynamic balance (today's $)",
+                          "Fixed after-tax income (today's $)",
                           "Dynamic after-tax income (today's $)",
                           "Spending need (today's $)"], start=1):
     header_cell(cd.cell(4, i), name)
@@ -1114,9 +1166,9 @@ for k in range(spec.TABLE_ROWS):
     r_ = R0 + k
     cd.cell(r_, 1, f"={q(start_age)}+{k}").font = font()
     guard = f"IF({k + 1}>{HORIZON},NA(),"
-    cd.cell(r_, 2, f"={guard}'4% Rule'!AF{r_})").number_format = CUR
+    cd.cell(r_, 2, f"={guard}{FIXED_REF}AF{r_})").number_format = CUR
     cd.cell(r_, 3, f"={guard}'Dynamic Strategy'!AJ{r_})").number_format = CUR
-    cd.cell(r_, 4, f"={guard}'4% Rule'!X{r_})").number_format = CUR
+    cd.cell(r_, 4, f"={guard}{FIXED_REF}X{r_})").number_format = CUR
     cd.cell(r_, 5, f"={guard}'Dynamic Strategy'!AB{r_})").number_format = CUR
     cd.cell(r_, 6, f"={guard}'Dynamic Strategy'!AC{r_})").number_format = CUR
 cd.sheet_state = "hidden"
@@ -1268,12 +1320,13 @@ engine.sheet_view.showGridLines = False
 eng_headers = [
     "Simulation", "Year", "Age", "Return", "Inflation", "Price index", "Planning years",
     "Ordinary tax rate", "Spending need (today's $)",
-    "4% taxable", "4% traditional", "4% Roth", "4% basis", "4% total", "4% target",
-    "4% withdrawal", "4% after-tax (today's $)",
+    "Fixed taxable", "Fixed traditional", "Fixed Roth", "Fixed basis", "Fixed total",
+    "Fixed target", "Fixed withdrawal", "Fixed after-tax (today's $)",
     "Dyn taxable", "Dyn traditional", "Dyn Roth", "Dyn basis", "Dyn total",
     "Dyn withdrawal", "Dyn after-tax (today's $)",
     "Return draw", "Inflation draw", "Historical row", "LTC draw", "Dyn withdrawal change",
-    "Social Security", "Dyn required gross",
+    "Social Security", "Dyn required gross", "Fixed required gross",
+    "Net need after Social Security", "Fixed taxable after tax", "Dyn taxable after tax",
 ]
 for col, name in enumerate(eng_headers, start=1):
     header_cell(engine.cell(4, col), name)
@@ -1357,17 +1410,28 @@ for sim in range(1, spec.MAX_SIMS + 1):
         # times, so inlining it would triple the formula text across 71,000 rows.
         engine.cell(r_, 30, "=" + ss_gross(f"C{r_}", f"F{r_}"))
 
-        # ---- 4% rule: J K L M state, N total, O target, P withdrawal, Q after-tax
+        # ---- fixed spending: J K L M state, N total, O target, P withdrawal, Q after-tax
+        # AF is the gross withdrawal that funds the year's need after tax; on the 4%
+        # basis it is computed but unused, which costs one column instead of branching
+        # the whole block. AG-AI are shared sub-expressions pulled out of AE and AF:
+        # each appears three times in a required-gross formula, and repeating them
+        # across 71,000 rows costs tens of megabytes of stored formula text.
+        engine.cell(r_, 33, "=" + net_need(f"I{r_}", f"F{r_}", f"AD{r_}", f"H{r_}"))
+        engine.cell(r_, 34, "=" + taxable_net(f"J{r_}", f"M{r_}"))
+        engine.cell(r_, 35, "=" + taxable_net(f"R{r_}", f"U{r_}"))
+        engine.cell(r_, 32, "=" + required_gross(f"J{r_}", f"K{r_}", f"M{r_}", f"H{r_}",
+                                                 f"AG{r_}", a=f"AH{r_}"))
         if year == 1:
             engine.cell(r_, 10, f"={q(taxable0)}")
             engine.cell(r_, 11, f"={q(traditional0)}")
             engine.cell(r_, 12, f"={q(roth0)}")
             engine.cell(r_, 13, f"={q(taxable0)}*{q(basis_share)}")
-            engine.cell(r_, 15,
-                        f"=IF({q(current_4pct)}>0,{q(current_4pct)},N{r_}*{q(rate4)})")
+            pct_target = f"IF({q(current_4pct)}>0,{q(current_4pct)},N{r_}*{q(rate4)})"
         else:
             roll_accounts(engine, r_, p, "J", "K", "L", "M", "P", (10, 11, 12, 13))
-            engine.cell(r_, 15, f"=O{p}*(1+E{p})")
+            pct_target = f"O{p}*(1+E{p})"
+        engine.cell(r_, 15,
+                    f'=IF({q(fixed_basis)}="{spec.BASIS_NEEDS}",AF{r_},{pct_target})')
         engine.cell(r_, 14, f"=J{r_}+K{r_}+L{r_}")
         engine.cell(r_, 16, f"=MIN(O{r_},N{r_})")
         engine.cell(r_, 17, after_tax_income(r_, "J", "K", "M", "P"))
@@ -1382,7 +1446,7 @@ for sim in range(1, spec.MAX_SIMS + 1):
             roll_accounts(engine, r_, p, "R", "S", "T", "U", "W", (18, 19, 20, 21))
         engine.cell(r_, 22, f"=R{r_}+S{r_}+T{r_}")
         engine.cell(r_, 31, "=" + required_gross(f"R{r_}", f"S{r_}", f"U{r_}", f"H{r_}",
-                                                 f"I{r_}", f"F{r_}", f"AD{r_}"))
+                                                 f"AG{r_}", a=f"AI{r_}"))
         guarded = (f"MIN({ceiling_at(f'C{r_}')}*V{r_},"
                    f"MAX({q(floor)}*V{r_},V{r_}/MAX(G{r_},0.5)))")
         if year == 1:
@@ -1399,11 +1463,12 @@ for sim in range(1, spec.MAX_SIMS + 1):
 
 outcomes = wb.create_sheet("MC Outcomes")
 out_headers = [
-    "Simulation", "4% lasts", "4% essentials met", "4% ending (today's $)",
-    "4% lowest income (today's $)", "4% cumulative income (today's $)",
+    "Simulation", "Fixed lasts", "Fixed essentials met", "Fixed ending (today's $)",
+    "Fixed lowest income (today's $)", "Fixed cumulative income (today's $)",
     "Dyn lasts", "Dyn essentials met", "Dyn ending (today's $)",
     "Dyn lowest income (today's $)", "Dyn cumulative income (today's $)",
-    "Dyn worst withdrawal change", "4% share of years covered", "Dyn share of years covered",
+    "Dyn worst withdrawal change", "Fixed share of years covered",
+    "Dyn share of years covered",
 ]
 for col, name in enumerate(out_headers, start=1):
     header_cell(outcomes.cell(4, col), name)
@@ -1469,7 +1534,7 @@ def oc(col):
     return f"'MC Outcomes'!{col}{O0}:INDEX('MC Outcomes'!{col}{O0}:{col}{O0 + spec.MAX_SIMS - 1},{MC_SIMS})"
 
 
-mc.cell(6, 5, "— 4% RULE —").font = font(bold=True, color=MS_BLUE)
+mc.cell(6, 5, "— FIXED SPENDING —").font = font(bold=True, color=MS_BLUE)
 mc_res(7, "Covers essential spending EVERY year", f"=AVERAGE({oc('C')})", PCT, True)
 mc_res(8, "Median share of years essentials are covered", f"=MEDIAN({oc('M')})", PCT, True)
 mc_res(9, "Portfolio lasts to plan-to age", f"=AVERAGE({oc('B')})")
@@ -1504,12 +1569,14 @@ for cell_ref in ("F7", "F8", "F17", "F18"):
 
 mc["E26"] = ("Read the FIRST TWO lines of each block. 'Portfolio lasts' is a weak test for the "
              "dynamic strategy — a rule that spends a percentage of whatever is left can almost "
-             "never reach zero, so it scores well by construction. Whether your essentials are "
-             "actually covered is the question that matters, and the share-of-years line tells "
-             "you how near a miss it is.")
+             "never reach zero, so it scores well by construction. It is a real test for Fixed "
+             "Spending, which takes its target regardless of what is left. Set the Fixed Spending "
+             "basis to your actual spending needs and this block becomes the direct answer to "
+             "'will my portfolio hold?': the share of 1,000 modelled paths in which the money "
+             "covers the life you actually plan to live.")
 mc["E26"].font = font(italic=True, color="595959", size=9)
 mc["E26"].alignment = Alignment(wrap_text=True, vertical="top")
-mc.merge_cells("E26:F29")
+mc.merge_cells("E26:F30")
 
 mc["B15"] = ("The random batch is fixed, so changing one assumption is compared against the same "
              "paths. Change MC_SEED in model_spec.py for an independent batch. Results are "
@@ -1558,7 +1625,7 @@ def res(label, formula, fmt=CUR, color=GREEN, section=False, bold=False, key=Non
 
 
 D_ = "'Dynamic Strategy'!"
-F_ = "'4% Rule'!"
+F_ = f"'{FIXED}'!"
 
 
 def idx(sheet, col, pos=None):
@@ -1578,9 +1645,12 @@ res("— DOES THE PLAN WORK? —", None, section=True)
 res("Dynamic: essentials covered every year?",
     f'=IF(SUMPRODUCT(({D_}$A${R0}:$A${RN}<={HORIZON})*({D_}$AD${R0}:$AD${RN}<-{spec.SHORTFALL_TOL}))=0,"YES","NO")',
     "General", BLACK, bold=True, key="dyn_ess")
-res("4% rule: essentials covered every year?",
+res("Fixed Spending: essentials covered every year?",
     f'=IF(SUMPRODUCT(({F_}$A${R0}:$A${RN}<={HORIZON})*({F_}$Z${R0}:$Z${RN}<-{spec.SHORTFALL_TOL}))=0,"YES","NO")',
-    "General", BLACK, bold=True, key="four_ess")
+    "General", BLACK, bold=True, key="four_ess",
+    note="On the 4%-of-starting-portfolio basis this asks whether Bengen's rule happens to "
+         "produce enough. On the spending-needs basis it asks the sharper question: can the "
+         "portfolio pay for your life at all? A NO there means the money genuinely ran out.")
 
 res("— DYNAMIC STRATEGY —", None, section=True, space=True)
 res("First-year after-tax income (today's $)", f"={D_}$AB${R0}", CUR, GREEN, key="dyn_first")
@@ -1634,7 +1704,7 @@ res("Roth accounts exhausted at", exhausted_at("AG"), "General", BLACK,
          "tax-free and it is not subject to RMDs. If this shows an age inside your plan, the "
          "portfolio has run out entirely.")
 
-res("— 4% RULE —", None, section=True, space=True)
+res("— FIXED SPENDING —", None, section=True, space=True)
 res("First-year after-tax income (today's $)", f"={F_}$X${R0}", CUR, GREEN, key="four_first")
 res("Lowest annual after-tax income (today's $)",
     f"=MIN({rng_to_horizon(F_, 'X')})", CUR, GREEN, key="four_low")
@@ -1687,7 +1757,7 @@ vcell.value = (
     f'DYNAMIC: essentials covered every year? "&$F${RES["dyn_ess"]}&'
     f'" — after-tax income "&TEXT($F${RES["dyn_low"]},"$#,##0")&" to "&'
     f'TEXT($F${RES["dyn_high"]},"$#,##0")&" a year in today''s dollars.     '
-    f'4% RULE: essentials covered every year? "&$F${RES["four_ess"]}&'
+    f'FIXED SPENDING ("&{q(fixed_basis)}&"): essentials covered every year? "&$F${RES["four_ess"]}&'
     f'" — lowest year "&TEXT($F${RES["four_low"]},"$#,##0")&'
     f'".     All figures are after tax and after fees."'
 )
@@ -1714,11 +1784,16 @@ diagnostics = [
      f'"OK: the age-graduated ceiling first caps spending at age "&{FIRST_BIND}&" ("&{CEIL_BINDS}&'
      f'" of "&{HORIZON}&" years). Before that the life-expectancy rule runs freely; after it, the '
      f'cap trims what would otherwise be an extreme withdrawal rate."))'),
-    (f'=IF(AND({q(plan_age)}-{q(start_age)}>30,{q(rate4)}>=0.04),'
+    (f'=IF({q(fixed_basis)}="{spec.BASIS_NEEDS}",'
+     f'"OK: the Fixed Spending track is targeting your actual spending needs, so its shortfall '
+     f'years and ending balance answer the question that matters — can this portfolio pay for '
+     f'your life? Set the basis back to 4% of starting portfolio for the familiar benchmark.",'
+     f'IF(AND({q(plan_age)}-{q(start_age)}>30,{q(rate4)}>=0.04),'
      f'"WARNING: you are modelling "&({q(plan_age)}-{q(start_age)})&" years, but the 4% rule was '
-     f'only ever validated for 30. Over this horizon 4% is not a safe rate — treat the 4% column '
-     f'as a reference point, not a plan.",'
-     f'"OK: the horizon is within the range the 4% rule was tested for.")'),
+     f'only ever validated for 30. Over this horizon 4% is not a safe rate — treat the Fixed '
+     f'Spending column as a reference point, not a plan. Switching its basis to your actual '
+     f'spending needs is the more useful test.",'
+     f'"OK: the horizon is within the range the 4% rule was tested for."))'),
     (f'=IF({q(plan_age)}-{q(start_age)}>{spec.TABLE_ROWS},'
      f'"WARNING: the horizon exceeds the {spec.TABLE_ROWS} rows in the tables and has been '
      f'truncated. Lower the plan-to age.","OK: the horizon fits inside the tables.")'),
@@ -1762,7 +1837,7 @@ diagnostics = [
     (f'=IF($F${RES["dyn_short"]}+$F${RES["four_short"]}=0,'
      f'"OK: both strategies fund your essentials in every modelled year.",'
      f'"WARNING: at these inputs the plan does not fully fund your needs — dynamic falls short in '
-     f'"&$F${RES["dyn_short"]}&" year(s), the 4% rule in "&$F${RES["four_short"]}&". The usual '
+     f'"&$F${RES["dyn_short"]}&" year(s), fixed spending in "&$F${RES["four_short"]}&". The usual '
      f'causes are pre-65 healthcare, the care event, and tax. Try a later start age, lower '
      f'essentials, or a larger portfolio.")'),
 ]
@@ -1800,7 +1875,7 @@ c1.y_axis.title = "Balance (today's $)"
 c1.x_axis.title = "Age"
 c1.x_axis.delete = False
 c1.y_axis.delete = False
-c1.series.append(Series(Reference(cd, min_col=2, min_row=R0, max_row=RN), title="4% rule"))
+c1.series.append(Series(Reference(cd, min_col=2, min_row=R0, max_row=RN), title="Fixed spending"))
 c1.series.append(Series(Reference(cd, min_col=3, min_row=R0, max_row=RN), title="Dynamic strategy"))
 c1.set_categories(Reference(cd, min_col=1, min_row=R0, max_row=RN))
 ws.add_chart(c1, f"B{CHART_ROW + 1}")
@@ -1812,7 +1887,8 @@ c2.y_axis.title = "Today's $ per year"
 c2.x_axis.title = "Age"
 c2.x_axis.delete = False
 c2.y_axis.delete = False
-c2.series.append(Series(Reference(cd, min_col=4, min_row=R0, max_row=RN), title="4% rule income"))
+c2.series.append(Series(Reference(cd, min_col=4, min_row=R0, max_row=RN),
+                        title="Fixed spending income"))
 c2.series.append(Series(Reference(cd, min_col=5, min_row=R0, max_row=RN),
                         title="Dynamic strategy income"))
 c2.series.append(Series(Reference(cd, min_col=6, min_row=R0, max_row=RN),
@@ -1838,8 +1914,8 @@ ins.column_dimensions["B"].width = 112
 
 instructions = [
     ("h1", "How to Use This Planner"),
-    ("p", "This workbook compares two ways to spend down a retirement portfolio: the classic 4% "
-          "rule and a flexible \"dynamic\" strategy (see the Article tab). Unlike a simple "
+    ("p", "This workbook compares two ways to spend down a retirement portfolio: a FIXED spending "
+          "target and a flexible \"dynamic\" strategy (see the Article tab). Unlike a simple "
           "illustration, it models tax, fees, required minimum distributions, pre-Medicare "
           "healthcare and long-term care, because those are what usually decide whether a plan "
           "actually works. It is still an educational tool, not financial advice."),
@@ -1850,12 +1926,33 @@ instructions = [
     ("p", "3. Scroll down for the two charts. The second one — after-tax income against what you "
           "need — is the one that answers 'can I afford this?'"),
     ("p", "4. Open the Monte Carlo tab and pressure-test both strategies."),
+    ("h2", "The two strategies, and the question each one answers"),
+    ("p", "The DYNAMIC strategy is portfolio-led. It recomputes a withdrawal each year from your "
+          "balance and your remaining life expectancy and never looks at what you need. It is "
+          "really an optimisation of portfolio longevity; meeting your spending is a hoped-for "
+          "consequence, not a constraint. Its ending balance therefore does not move at all when "
+          "you change your essential spending."),
+    ("p", "The FIXED SPENDING strategy is target-led. It picks a number and takes it regardless of "
+          "what the portfolio is doing, so it genuinely can run out — which is what makes it the "
+          "useful stress test. The input \"Fixed Spending target basis\" chooses that number:"),
+    ("p", "   • 4% of starting portfolio (default) — Bengen's classic rule. 4% of the opening "
+          "balance in year one, then that dollar amount grown by inflation. This is the familiar "
+          "benchmark, and it is deliberately blind to what you actually need."),
+    ("p", "   • Your actual spending needs — each year the model solves for the gross withdrawal "
+          "that funds your essentials, pre-65 healthcare and any long-term care AFTER tax, net of "
+          "Social Security. This is the spending-led model: it answers \"will my portfolio pay "
+          "for my life?\" rather than \"what would 4% have given me?\""),
+    ("p", "Set the basis to your actual spending needs and run the Monte Carlo tab, and the Fixed "
+          "Spending block becomes a direct answer to the question most people are really asking: "
+          "across 1,000 modelled markets, in what share of them does the money hold?"),
     ("h2", "The one number to look at"),
     ("p", "\"Covers essential spending every year\" is the headline metric, not \"portfolio "
           "lasts\". A strategy that withdraws a percentage of whatever is left can almost never "
-          "reach zero, so it scores nearly 100% on survival no matter how badly it is doing. That "
-          "flatters it. The honest question is whether the income it produces actually covers "
-          "your needs in every year, which is what the essentials test measures."),
+          "reach zero, so the dynamic strategy scores nearly 100% on survival no matter how badly "
+          "it is doing. That flatters it. The honest question is whether the income it produces "
+          "actually covers your needs in every year, which is what the essentials test measures. "
+          "For Fixed Spending on the needs basis the two metrics converge, because there the only "
+          "way to miss your essentials is to have run out of money."),
     ("h2", "Everything is after tax"),
     ("p", "Enter your essential spending as an AFTER-TAX number, because that is what you really "
           "have to fund. The model applies your effective tax rate to the tax-deferred share of "
@@ -1952,16 +2049,17 @@ instructions = [
     ("p", "The dynamic strategy is designed to be re-run annually. Set the retirement start age to "
           "your current age and the portfolio to your current balance; year 1 becomes the coming "
           "year and the first-year figure is your suggested amount. Come back each year and "
-          "update both. For the 4% column, enter your existing inflation-adjusted withdrawal in "
-          "\"Current 4% rule withdrawal\" if you want it continued rather than restarted."),
+          "update both. For the Fixed Spending column, enter your existing inflation-adjusted "
+          "withdrawal in \"Current 4% rule withdrawal\" if you want it continued rather than "
+          "restarted — that input is ignored on the spending-needs basis, which re-solves the "
+          "target from scratch each year."),
     ("h2", "What this model still does not do"),
-    ("p", "It uses one blended portfolio rather than separate traditional, Roth and taxable "
-          "accounts, so it cannot model withdrawal sequencing or Roth conversions. Tax is a "
-          "single effective rate, not brackets, and capital gains in taxable accounts are treated "
-          "as tax-free. It ignores state-specific rules, IRMAA surcharges, survivor benefit "
-          "changes, and any reduction in Social Security if the trust fund is not topped up. "
-          "Every one of these omissions makes the plan look slightly BETTER than reality, so "
-          "treat a marginal result as a failing one."),
+    ("p", "Tax is a single effective rate per phase, not real brackets, so there is no Social "
+          "Security tax torpedo and no bracket-filling or Roth-conversion logic. It ignores "
+          "state-specific rules, IRMAA surcharges, survivor benefit changes, and any reduction in "
+          "Social Security if the trust fund is not topped up. Every one of these omissions makes "
+          "the plan look slightly BETTER than reality, so treat a marginal result as a failing "
+          "one."),
     ("h2", "Colour key"),
     ("p", "Yellow = inputs you can edit.  Black = calculated.  Green = pulled from another tab.  "
           "Grey = restated in today's dollars.  Red = a shortfall or a depleted balance."),
@@ -2117,7 +2215,7 @@ for kind, text in article:
 # ===================================================================
 # Tab order, protection, save
 # ===================================================================
-order = ["Instructions", "Inputs & Summary", "Monte Carlo", "Dynamic Strategy", "4% Rule",
+order = ["Instructions", "Inputs & Summary", "Monte Carlo", "Dynamic Strategy", FIXED,
          "Life Expectancy", "Historical Returns", "Reference Tables", "Article",
          "Chart Data", "MC Engine", "MC Outcomes"]
 wb._sheets.sort(key=lambda s: order.index(s.title))

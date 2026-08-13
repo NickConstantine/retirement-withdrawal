@@ -2,11 +2,20 @@
 
 An Excel retirement planner that compares two ways to spend down a portfolio:
 
-1. **The classic 4% rule** — withdraw 4% of the starting portfolio in year one, then
-   raise that dollar amount by inflation every year (William Bengen, 1994).
+1. **Fixed spending** — pick a target and take it regardless of what the portfolio does.
+   The target is either *4% of the starting portfolio* grown by inflation (William
+   Bengen, 1994) or *your actual spending needs*, re-solved after tax every year. This
+   is the strategy that can genuinely run out, which is what makes it the useful stress
+   test.
 2. **A dynamic strategy** — recompute spending each year from your current balance and
    remaining life expectancy, kept inside **guardrails** (a floor/ceiling withdrawal
    band) and smoothed by a **shock absorber** (a cap on year-to-year spending changes).
+
+The two answer different questions. The dynamic strategy is portfolio-led: it optimises
+for the money lasting and treats meeting your spending as a hoped-for consequence, which
+is why its ending balance does not move at all when you change essential spending. Fixed
+spending on the needs basis is spending-led: it asks whether the portfolio can pay for
+the life you actually plan to live.
 
 It is inspired by the Wall Street Journal article *"The 4% Rule for Retirement Is Too
 Simple. Here's a Better Way."*, but it is built to be **used**, not just to illustrate
@@ -17,7 +26,7 @@ It is still an educational tool, **not financial advice**.
 The workbook is generated entirely from code. Do not hand-edit the `.xlsx`; your changes
 will be overwritten on the next build.
 
-> **The generated `.xlsx` is not committed.** At ~50 MB it exceeds GitHub's warning
+> **The generated `.xlsx` is not committed.** At ~40 MB it exceeds GitHub's warning
 > threshold, and because every rebuild rewrites the whole binary it would add that much to
 > history each time it changed. It is in `.gitignore`; regenerate it with the workflow
 > below, or publish it as a GitHub Release asset when you want to share it.
@@ -32,8 +41,8 @@ will be overwritten on the next build.
 | `build_retirement_planner.py` | Builds the workbook (tabs, formulas, charts, conditional formatting, data validation, comments, sheet protection) with **openpyxl**. |
 | `recalc_excel.ps1` | Opens the workbook via Excel COM, forces a full recalculation, scans for error values using `SpecialCells` (fast — not a per-cell walk), and re-saves. Reports `STATUS: success - zero formula errors`. |
 | `validate_model.py` | **The real correctness gate.** Recomputes the entire model independently in Python and compares ~18,500 cells against the values Excel calculated — every row of both strategy tabs, the life-expectancy engine, all 1,000 Monte Carlo outcomes, and the results panel. |
-| `test_scenarios.py` | Drives the workbook through 40 alternate input sets **and 6 Monte Carlo configurations** via COM (edge-case ages, couples, stagflation, account mixes, both ceiling bases, both shortfall modes, parametric vs historical bootstrap…) and re-checks every one against the shadow model. This is what catches bugs that only appear when inputs move. |
-| `test_inputs_live.py` | Perturbs all 46 inputs — each in a context where it *should* matter — and asserts something downstream changes. Catches an input that is added to the sheet and to `DEFAULTS` but never wired into a formula: the workbook would still build, still recalculate without error, and silently ignore the user. Pure Python, no Excel needed. |
+| `test_scenarios.py` | Drives the workbook through 50 alternate input sets **and 8 Monte Carlo configurations** via COM (edge-case ages, couples, stagflation, account mixes, both ceiling bases, both shortfall modes, parametric vs historical bootstrap…) and re-checks every one against the shadow model. This is what catches bugs that only appear when inputs move. |
+| `test_inputs_live.py` | Perturbs all 47 inputs — each in a context where it *should* matter — and asserts something downstream changes. Catches an input that is added to the sheet and to `DEFAULTS` but never wired into a formula: the workbook would still build, still recalculate without error, and silently ignore the user. Pure Python, no Excel needed. |
 | `patch_metadata.py` | Strips personal author metadata that Excel stamps on save. |
 | `.gitignore` | Excludes the generated workbook, Excel `~$` lock files and `__pycache__`. |
 
@@ -66,7 +75,7 @@ STATUS: success - zero formula errors
 cells compared: 18,532
 STATUS: success - model matches Excel on every compared cell
 STATUS: success - every input changes the model
-STATUS: success - all 40 input scenarios and 6 Monte Carlo scenarios match the shadow model
+STATUS: success - all 50 input scenarios and 8 Monte Carlo scenarios match the shadow model
 metadata patched. creator: Retirement Planner | lastModifiedBy: Retirement Planner
 ```
 
@@ -80,8 +89,8 @@ metadata patched. creator: Retirement Planner | lastModifiedBy: Retirement Plann
 > **sheet order is load-bearing**: `Worksheet.Calculate()` reads whatever the *other*
 > sheets currently hold, so a sheet calculated too early sees stale precedents. The order
 > in `recalc_deterministic()` is Monte Carlo → Historical Returns → Life Expectancy →
-> 4% Rule → Dynamic Strategy → MC Engine → MC Outcomes. Getting it wrong fails loudly
-> (mismatches, never false passes) — but it does fail, so do not reorder casually.
+> Fixed Spending → Dynamic Strategy → MC Engine → MC Outcomes. Getting it wrong fails
+> loudly (mismatches, never false passes) — but it does fail, so do not reorder casually.
 
 > **The suite uses `DispatchEx`, not `Dispatch`.** Plain `Dispatch` attaches to an
 > already-running Excel instance, so the suite would drive *your* open workbook and die
@@ -94,7 +103,7 @@ metadata patched. creator: Retirement Planner | lastModifiedBy: Retirement Plann
   a verdict box, the results panel, **plan diagnostics**, the scenario detail table, and
   two charts.
 - **Monte Carlo** — parametric and historical-bootstrap pressure tests over 1,000 shared paths.
-- **Dynamic Strategy** / **4% Rule** — year-by-year detail, hover notes on every column.
+- **Dynamic Strategy** / **Fixed Spending** — year-by-year detail, hover notes on every column.
 - **Life Expectancy** — interpolated remaining-years table plus the survival curve and
   last-survivor (joint) life expectancy.
 - **Historical Returns** — S&P 500, 10-year Treasury and CPI, 1928–2025.
@@ -104,6 +113,19 @@ metadata patched. creator: Retirement Planner | lastModifiedBy: Retirement Plann
 
 ## Key model conventions
 
+- **The Fixed Spending target basis is a single global switch.** `fixed_basis` chooses
+  between the inflation-grown percentage chain and a fresh needs solve every year, and
+  because the whole column is one or the other there is no cross-contamination: on the
+  percentage basis `target = prev_target × (1 + inflation)` reads a previous *percentage*
+  target, never a previous solved requirement. `current_4pct` is ignored on the needs
+  basis by construction.
+- **On the needs basis, "essentials met" and "money lasts" collapse into one metric.**
+  The withdrawal is `min(target, balance)`, so the only way to miss the need is to have
+  taken the entire balance — which leaves exactly zero and can never recover. The Monte
+  Carlo run confirms this: both figures come back identical. The one theoretical gap is a
+  final year that drains the portfolio to *exactly* zero while still funding the need
+  (`lasts` tests `balance > 0`, `met` tests income within `SHORTFALL_TOL`), which is a
+  measure-zero boundary rather than a bug. A large divergence means something is wrong.
 - **Horizon.** Years modelled = `plan_age - start_age`, covering ages `start_age` through
   `plan_age - 1`. The "balance at plan-to age" is the **ending** balance of the last of
   those years. Getting this off by one shifts every headline number.
@@ -145,6 +167,12 @@ metadata patched. creator: Retirement Planner | lastModifiedBy: Retirement Plann
   It is written that way in both the builder and the shadow model deliberately: the closed-
   form algebra is easy to get sign-wrong, and a sign error there silently changes results
   rather than raising an error.
+- **Formula text is a real cost on the 71,000-row engine.** `required_gross()` repeats
+  its `short` and `a` sub-expressions three times each. Inlining both for the two tracks
+  pushed the workbook to 68 MB; pulling them into three helper columns (`net_need` shared
+  by both tracks, plus one `taxable_net` per track) brought it back to 40 MB with
+  bit-identical results. When you add anything to the engine, factor repeated
+  sub-expressions into columns first.
 - **Coverage tests use `SHORTFALL_TOL`, not a raw `< 0`.** In *cover needs* mode income
   equals the need *exactly*, so floating-point noise leaves surpluses around 1e-11 — and
   Excel and Python round those to opposite sides of zero. Every "did this year fall short"
@@ -163,7 +191,10 @@ up as extra shortfall years while leaving the ending balance unchanged. In **Wit
 enough to cover needs** the model solves for the gross withdrawal that nets the need after
 tax and takes it, so hard bills actually deplete the portfolio. Neither is wholly right:
 discretionary spending really is flexible, unavoidable costs really are not. Run both and
-read the spread.
+read the spread. The Fixed Spending tab has its own version of the same choice — the
+*target basis* — and setting it to your actual spending needs is the cleanest way to ask
+whether the portfolio can pay for your life, because that track has no guardrails to hide
+behind.
 
 Tax is a single effective rate per phase rather than real brackets, so there is no
 Social-Security tax torpedo and no bracket-filling logic; Roth conversions and
